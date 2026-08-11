@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 import threading
 import hashlib
 import time
@@ -23,6 +24,7 @@ from .preprocessing import (
     VOICE_STORY_COMMAND_RE,
     normalize_spaces,
     rejection_reason,
+    significant_words,
 )
 from .repository import ChatRepository
 from .provider_factory import create_llm_provider, create_llm_providers
@@ -33,6 +35,15 @@ log = logging.getLogger(__name__)
 SUBSCRIPTION_REQUIRED = (
     "🔒 OpenAI-модуль Киберстула доступен только в основном чате. "
     "Для этого чата потребуется подписка."
+)
+
+# These are jokes about being invoked, rather than about the conversation.
+# The first genuinely novel one may pass; repeats are suppressed for a long
+# time by _chair_call_meta_joke_on_cooldown.
+CHAIR_CALL_META_JOKE_RE = re.compile(
+    r"(?:опять|снова|вновь).{0,30}(?:зов[её]т|ор[её]т|клич[её]т|вызвал|позвал)"
+    r".{0,30}(?:стул|меня)|(?:зов[её]те|ор[её]те|кличете).{0,30}(?:стул|меня)",
+    re.I,
 )
 
 
@@ -286,6 +297,15 @@ class LearningService:
             max_words or self.settings.max_generated_words + 8,
         )[0]
 
+    def _chair_call_meta_joke_on_cooldown(self, chat_id, text):
+        if not CHAIR_CALL_META_JOKE_RE.search(text or ""):
+            return False
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        return any(
+            CHAIR_CALL_META_JOKE_RE.search(row["text"] or "")
+            for row in self.repository(chat_id).generated_since(since)
+        )
+
     def _message_context(self, message):
         text = getattr(message, "text", "") or ""
         user = getattr(message, "from_user", None)
@@ -366,6 +386,9 @@ class LearningService:
             if opening.startswith(("харакири", "создатель", "опять")):
                 log.info("Creator reply blocked because of a repetitive opening chat=%s", chat_id)
                 return None
+        if result and self._chair_call_meta_joke_on_cooldown(chat_id, result):
+            log.info("Repeated chair-call meta joke blocked chat=%s", chat_id)
+            return None
         if result and self._valid(result, context, chat_id=chat_id, max_words=max_words):
             self.persona.record_usage(
                 chat_id, selection.meme_ids, selection.cooldown_groups
@@ -581,6 +604,28 @@ class LearningService:
         if not self.triggers.allowed(chat_id, "stul_cooldown", addressed=True):
             return None
 
+        # “стул” is an address, never the subject by itself.  A call that also
+        # contains a real topic must reach the contextual model even if it has
+        # no question mark; otherwise rapid calls degrade into Markov jokes
+        # about the invocation rather than answering the chat.
+        subject = self.persona._strip_chair_invocation(message.text)
+        if significant_words(subject):
+            result = self.generate_openai(
+                chat_id,
+                self._message_context(message),
+                "reply",
+            )
+            provider = "openai"
+            if result:
+                self.triggers.commit(chat_id, "stul_cooldown")
+                self.repository(chat_id).record_generated(result, "stul_cooldown")
+                log.info(
+                    "Contextual chair call answered chat=%s provider=%s",
+                    chat_id,
+                    provider,
+                )
+            return result
+
         frequency = self.triggers.note_chair(chat_id)
         roll = self.rng.random()
         ai_threshold = self.settings.reply_to_stul_chance
@@ -603,6 +648,9 @@ class LearningService:
             return None
 
         if result:
+            if self._chair_call_meta_joke_on_cooldown(chat_id, result):
+                log.info("Repeated chair-call meta joke blocked chat=%s", chat_id)
+                return None
             self.triggers.commit(chat_id, "stul_cooldown")
             self.repository(chat_id).record_generated(result, "stul_cooldown")
             log.info(

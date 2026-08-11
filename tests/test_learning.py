@@ -264,10 +264,10 @@ class LearningTests(unittest.TestCase):
             self.assertIsNotNone(service.maybe_question_reply(incoming))
         local.assert_not_called()
 
-    def test_frequent_second_chair_call_prefers_markov(self):
+    def test_frequent_bare_chair_call_can_prefer_markov(self):
         service = LearningService(self.settings(), rng=FixedRandom(0.20))
         service.note_stul(-1)
-        incoming = message(-1, 2, "стул второй раз за минуту")
+        incoming = message(-1, 2, "стул")
         with (
             patch.object(service, "generate_openai") as ai,
             patch.object(service, "generate_local", return_value="локальный ответ маркова") as markov,
@@ -275,6 +275,31 @@ class LearningTests(unittest.TestCase):
             self.assertEqual(service.maybe_stul_cooldown_reply(incoming), "локальный ответ маркова")
         ai.assert_not_called()
         markov.assert_called_once()
+
+    def test_ten_contextual_chair_calls_answer_their_topics(self):
+        service = LearningService(
+            self.settings(addressed_cooldown=0), rng=FixedRandom(0.20)
+        )
+        topics = [
+            "серега охуел", "кто тут прав", "я опять проспал", "она не отвечает",
+            "фильм говно", "катку доиграю и спать", "начал бегать", "куртка за 70к",
+            "вчера бухал", "ничего не делал весь день",
+        ]
+        with (
+            patch.object(
+                service,
+                "generate_openai",
+                side_effect=[f"ответ по теме {index}" for index in range(10)],
+            ) as ai,
+            patch.object(service, "generate_local") as markov,
+        ):
+            results = [
+                service.maybe_stul_cooldown_reply(message(-1, index + 1, f"стул {topic}"))
+                for index, topic in enumerate(topics)
+            ]
+        self.assertEqual(results, [f"ответ по теме {index}" for index in range(10)])
+        self.assertEqual(ai.call_count, 10)
+        self.assertEqual(markov.call_count, 0)
 
     def test_raw_memory_is_bounded_but_statistics_survive(self):
         repository = ChatRepository(self.data_dir, -9, max_messages=3)

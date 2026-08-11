@@ -84,6 +84,12 @@ class PersonaAndTrollModeTests(unittest.TestCase):
         result = self.build()
         self.assertIn("CyberChair / chairOS by id:28", result.request.instructions)
 
+    def test_chair_address_is_not_sent_as_the_subject(self):
+        request = self.build(context="стул серега охуел?").request
+        self.assertIn("Смысл целевого сообщения: серега охуел?", request.input)
+        self.assertNotIn("Целевое сообщение: стул", request.input)
+        self.assertIn("не строй реплику вокруг того, что тебя позвали", request.instructions)
+
     def test_sglypa_reply_prompt_forbids_stock_introduction(self):
         result = self.build(purpose="sglypa")
         self.assertIn("Не начинай с", result.request.input)
