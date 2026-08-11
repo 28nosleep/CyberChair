@@ -8,3 +8,6 @@ learning/__pycache__/
 tests/__pycache__/
 .pytest_cache/
 *.pyc
+.DS_Store
+*.zip
+cyberstul-update-2026-08-06-v3.4.0/
