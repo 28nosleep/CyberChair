@@ -78,6 +78,7 @@ SGLYPA_REPLY_COOLDOWN = 15
 SGLYPA_USERNAME = "sglypa_tg_bot"
 FREEKUCHER_REPLY_COOLDOWN = 60
 CHAIR_REMAINING_COMMAND_RE = re.compile(r"^\s*с\s+стул\s*$", re.IGNORECASE)
+CHAIR_MEME_COMMAND_RE = re.compile(r"^\s*с\s+м\s+стул\s*$", re.IGNORECASE)
 
 bot_state = {
     "known_users": {},
@@ -441,7 +442,6 @@ def send_restart_gif():
             "Стартовая GIF не найдена: %s", restart_gif_path
         )
         return False
-
     try:
         with restart_gif_path.open("rb") as animation:
             bot.send_animation(CHAT_ID, animation)
@@ -451,6 +451,48 @@ def send_restart_gif():
             "Не удалось отправить стартовую GIF: %s", type(error).__name__
         )
         return False
+
+
+def send_startup_meme():
+    """Send the persistent one-shot meme after the next successful restart."""
+    decision = learning_service.startup_meme(CHAT_ID)
+    if not decision:
+        return False
+    rendered = learning_service.render_meme(decision)
+    if not rendered:
+        return False
+    try:
+        with rendered.path.open("rb") as image:
+            bot.send_photo(CHAT_ID, image)
+        learning_service.mark_startup_meme_sent(decision, CHAT_ID)
+        return True
+    except Exception as error:
+        logging.getLogger(__name__).warning(
+            "Не удалось отправить стартовый мем: %s", type(error).__name__
+        )
+        return False
+    finally:
+        learning_service.cleanup_rendered_meme(rendered)
+
+
+def send_manual_meme(message, decision):
+    rendered = learning_service.render_meme(decision)
+    if not rendered:
+        return False
+    try:
+        with rendered.path.open("rb") as image:
+            bot.send_photo(
+                message.chat.id, image, reply_to_message_id=message.message_id,
+            )
+        learning_service.mark_command_meme_sent(message.chat.id, decision)
+        return True
+    except Exception as error:
+        logging.getLogger(__name__).warning(
+            "Не удалось отправить мем по команде: %s", type(error).__name__
+        )
+        return False
+    finally:
+        learning_service.cleanup_rendered_meme(rendered)
 
 
 def user_mention(user):
@@ -995,6 +1037,16 @@ def handle_message(message):
     if FOREIGN_BOT_COMMAND_RE.search(text):
         return
 
+    if CHAIR_MEME_COMMAND_RE.fullmatch(text):
+        if learning_service.meme_command_on_cooldown(message.chat.id):
+            bot.reply_to(message, "🪑 мем на кулдауне")
+            return
+        decision = learning_service.maybe_command_meme(message.chat.id)
+        if decision and send_manual_meme(message, decision):
+            return
+        bot.reply_to(message, "🪑 мем не сгенерировался")
+        return
+
     if CHAIR_REMAINING_COMMAND_RE.fullmatch(text):
         bot.reply_to(message, chair_remaining_message())
         return
@@ -1163,6 +1215,8 @@ def main():
     print("📅 Режим: Понедельник–Пятница")
     print("=" * 50)
     print("Запускаем бесконечный поллинг...")
+
+    send_startup_meme()
 
     while True:
 

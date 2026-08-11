@@ -276,6 +276,32 @@ class LearningTests(unittest.TestCase):
         ai.assert_not_called()
         markov.assert_called_once()
 
+    def test_manual_meme_command_uses_ai_caption_and_two_minute_cooldown(self):
+        service = LearningService(
+            self.settings(manual_meme_cooldown=120),
+            openai_client=FakeOpenAI("серега опять выбрал сайдквест"),
+        )
+        decision = service.maybe_command_meme(-1)
+        self.assertEqual(decision.action, "meme")
+        self.assertEqual(decision.caption_text, "серега опять выбрал сайдквест")
+        self.assertIn("3–8 слов", service.openai._client.responses.calls[0]["input"])
+        service.mark_command_meme_sent(-1, decision)
+        self.assertTrue(service.meme_command_on_cooldown(-1))
+        self.assertIsNone(service.maybe_command_meme(-1))
+
+    def test_bot_manual_meme_command_reports_cooldown_without_time(self):
+        import bot as bot_module
+
+        incoming = message(-1, 222, "с м стул")
+        with (
+            patch.object(bot_module.learning_service, "meme_command_on_cooldown", return_value=True),
+            patch.object(bot_module.bot, "reply_to") as reply,
+            patch.object(bot_module, "remember_user") as remember,
+        ):
+            bot_module.handle_message(incoming)
+        reply.assert_called_once_with(incoming, "🪑 мем на кулдауне")
+        remember.assert_not_called()
+
     def test_ten_contextual_chair_calls_answer_their_topics(self):
         service = LearningService(
             self.settings(addressed_cooldown=0), rng=FixedRandom(0.20)

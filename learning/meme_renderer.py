@@ -91,7 +91,7 @@ class MemeRenderer:
             int(box[2] * width), int(box[3] * height),
         )
 
-    def _draw_caption(self, image, text, safe_box):
+    def _draw_caption(self, image, text, safe_box, fill="white", stroke_fill="black"):
         left, top, right, bottom = safe_box
         draw = ImageDraw.Draw(image)
         chosen = None
@@ -121,8 +121,8 @@ class MemeRenderer:
             line_width, line_height = box[2] - box[0], box[3] - box[1]
             x = left + max(0, (right - left - line_width) // 2)
             draw.text(
-                (x, y), line, font=font, fill="white",
-                stroke_width=stroke, stroke_fill="black",
+                (x, y), line, font=font, fill=fill,
+                stroke_width=stroke, stroke_fill=stroke_fill,
             )
             bounds[0] = min(bounds[0], x)
             bounds[1] = min(bounds[1], y)
@@ -157,11 +157,17 @@ class MemeRenderer:
                 )
             else:
                 safe_boxes = (self._pixel_box(asset.text_box, width, height),)
+            caption_fill, caption_stroke = (
+                ("black", "white") if profile == "phone_screen_light"
+                else ("white", "black")
+            )
             rendered = []
             for index, caption in enumerate(captions):
                 if index >= len(safe_boxes):
                     return None
-                result = self._draw_caption(image, caption, safe_boxes[index])
+                result = self._draw_caption(
+                    image, caption, safe_boxes[index], caption_fill, caption_stroke
+                )
                 if not result:
                     return None
                 rendered.append(result)

@@ -179,6 +179,7 @@ class CharacterizationTests(unittest.TestCase):
             patch.dict(bot_module.os.environ, {"XAI_API_KEY": "configured"}),
             patch.object(bot_module, "send_startup_quote") as quote,
             patch.object(bot_module, "send_restart_gif") as gif,
+            patch.object(bot_module, "send_startup_meme") as meme,
             patch.object(bot_module.threading, "Thread", return_value=fake_thread) as thread,
             patch.object(bot_module.bot, "infinity_polling", side_effect=KeyboardInterrupt) as polling,
         ):
@@ -186,6 +187,7 @@ class CharacterizationTests(unittest.TestCase):
                 bot_module.main()
         quote.assert_not_called()
         gif.assert_not_called()
+        meme.assert_called_once_with()
         thread.assert_called_once()
         self.assertTrue(thread.call_args.kwargs["daemon"])
         fake_thread.start.assert_called_once_with()

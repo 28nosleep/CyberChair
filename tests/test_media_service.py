@@ -259,9 +259,16 @@ class MediaServiceTests(unittest.TestCase):
         learning.set_troll_mode(-1, False)
         self.assertTrue(learning.claim_scheduled_event(-1, "utility:start"))
 
+    def test_startup_meme_is_persistent_one_shot(self):
+        learning = LearningService(self.settings, llm_provider=Provider())
+        first = learning.startup_meme()
+        self.assertEqual((first.action, first.template_id), ("meme", "t800_chud"))
+        learning.mark_startup_meme_sent(first)
+        self.assertIsNone(learning.startup_meme())
+
     def test_catalog_is_data_driven_and_versioned(self):
-        self.assertEqual(self.catalog.version, "2.1.0")
-        self.assertGreaterEqual(len(self.catalog.assets), 4)
+        self.assertEqual(self.catalog.version, "2.2.0")
+        self.assertGreaterEqual(len(self.catalog.assets), 17)
         self.assertTrue(all(asset.contexts and asset.tags and asset.source_url for asset in self.catalog.assets))
         self.assertTrue(all(self.catalog.resolve(asset).is_file() for asset in self.catalog.assets))
 
@@ -374,6 +381,19 @@ class MemeRendererTests(unittest.TestCase):
         self.assertLessEqual(right, safe_right)
         self.assertLessEqual(bottom, safe_bottom)
         self.renderer.cleanup(result)
+
+    def test_phone_templates_draw_text_inside_phone_screen(self):
+        for template_id in ("chudjak_phone_scream", "feraljak_phone_rage"):
+            result = self.renderer.render(template_id, "ОНА ПРОЧИТАЛА И МОЛЧИТ")
+            self.assertIsNotNone(result)
+            self.assertIn("phone_screen", result.render_profile)
+            left, top, right, bottom = result.text_box
+            safe_left, safe_top, safe_right, safe_bottom = result.safe_box
+            self.assertGreaterEqual(left, safe_left)
+            self.assertGreaterEqual(top, safe_top)
+            self.assertLessEqual(right, safe_right)
+            self.assertLessEqual(bottom, safe_bottom)
+            self.renderer.cleanup(result)
 
     def test_caption_uses_visible_outline(self):
         source = inspect.getsource(MemeRenderer._draw_caption)

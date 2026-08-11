@@ -96,6 +96,13 @@ class PersonaAndTrollModeTests(unittest.TestCase):
         self.assertIn("сразу бей по сути", result.request.input)
         self.assertEqual(result.request.max_output_tokens, 50)
 
+    def test_meme_caption_is_short_and_has_no_emoji(self):
+        request = self.build(purpose="meme_caption").request
+        self.assertIn("3–8 слов", request.input)
+        self.assertIn("без emoji", request.input)
+        self.assertEqual(request.max_output_tokens, 30)
+        self.assertIn("не заканчивай ими сообщения автоматически", request.instructions)
+
     def test_troll_mode_off_uses_neutral_persona(self):
         result = self.build(troll_mode=False)
         self.assertNotIn("офисный стул-киборг", result.request.instructions)

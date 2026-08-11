@@ -609,7 +609,11 @@ class LearningService:
         # no question mark; otherwise rapid calls degrade into Markov jokes
         # about the invocation rather than answering the chat.
         subject = self.persona._strip_chair_invocation(message.text)
-        if significant_words(subject):
+        subject_words = {
+            word for word in significant_words(subject)
+            if word not in {"еще", "ещё", "раз", "снова", "опять", "второй"}
+        }
+        if subject_words:
             result = self.generate_openai(
                 chat_id,
                 self._message_context(message),
@@ -938,6 +942,74 @@ class LearningService:
         if not isinstance(decision, MediaDecision) or decision.action != "meme":
             return None
         return self.meme_renderer.render(decision.template_id, decision.caption_text)
+
+    def startup_meme(self, chat_id=None):
+        """Return the one-time meme reserved for the next successful restart."""
+        chat_id = self.settings.openai_chat_id if chat_id is None else chat_id
+        if chat_id is None or not self.troll_mode(chat_id) or not self.media_enabled(chat_id):
+            return None
+        repository = self.repository(chat_id)
+        if repository.setting("startup_meme_v1", "0") == "1":
+            return None
+        asset = self.media_catalog.get("t800_chud")
+        if not asset or not self.media_catalog.resolve(asset):
+            return None
+        return MediaDecision(
+            action="meme", asset_id=asset.id, template_id=asset.id,
+            caption_text="chairOS online: мемная подсистема активирована",
+            confidence=1.0, reason="startup_meme_v1",
+            asset_key=asset.id, cooldown_group=asset.cooldown_group,
+            archetype=asset.archetype,
+        )
+
+    def mark_startup_meme_sent(self, decision, chat_id=None):
+        chat_id = self.settings.openai_chat_id if chat_id is None else chat_id
+        if chat_id is None or not isinstance(decision, MediaDecision):
+            return
+        repository = self.repository(chat_id)
+        self.media.commit(repository, decision)
+        repository.record_generated(decision.template_id or "startup_meme", "startup_meme")
+        repository.set_setting("startup_meme_v1", "1")
+
+    def meme_command_on_cooldown(self, chat_id):
+        since = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=self.settings.manual_meme_cooldown)
+        ).isoformat()
+        return bool(self.repository(chat_id).generated_since(since, "manual_meme"))
+
+    def maybe_command_meme(self, chat_id):
+        """Build an AI caption and choose a local template for ``с м стул``."""
+        if (
+            not self.troll_mode(chat_id)
+            or not self.media_enabled(chat_id)
+            or self.meme_command_on_cooldown(chat_id)
+            or not self.provider_available(chat_id)
+        ):
+            return None
+        caption = self.generate_openai(chat_id, None, "meme_caption")
+        if not caption:
+            return None
+        candidates = [
+            asset for asset in self.media_catalog.assets
+            if asset.type == "meme_template" and self.media_catalog.resolve(asset)
+        ]
+        if not candidates:
+            return None
+        asset = self.rng.choice(candidates)
+        return MediaDecision(
+            action="meme", asset_id=asset.id, template_id=asset.id,
+            caption_text=caption, confidence=1.0, reason="manual_ai_meme",
+            asset_key=asset.id, cooldown_group=asset.cooldown_group,
+            archetype=asset.archetype,
+        )
+
+    def mark_command_meme_sent(self, chat_id, decision):
+        if not isinstance(decision, MediaDecision):
+            return
+        repository = self.repository(chat_id)
+        self.media.commit(repository, decision)
+        repository.record_generated(decision.template_id or "manual_meme", "manual_meme")
 
     def cleanup_rendered_meme(self, result):
         self.meme_renderer.cleanup(result)
