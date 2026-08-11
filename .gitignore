@@ -1,0 +1,10 @@
+.env
+venv/
+bot_state.json
+bot_state.tmp
+data/
+__pycache__/
+learning/__pycache__/
+tests/__pycache__/
+.pytest_cache/
+*.pyc

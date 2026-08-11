@@ -1,0 +1,4 @@
+pyTelegramBotAPI==4.36.0
+pytz==2026.3.post1
+openai>=2.0.0,<3.0.0
+Pillow==11.3.0
