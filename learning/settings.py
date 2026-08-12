@@ -76,7 +76,13 @@ class LearningSettings:
     # Raw chat text is deliberately short-lived. Durable context is stored as
     # summaries and stable memories, never as an unbounded transcript.
     max_messages_per_chat: int = field(default_factory=lambda: _int("MAX_MESSAGES_PER_CHAT", 50))
+    # This is a hard ceiling for the rare context-heavy request.  Normal chat
+    # turns use the smaller per-purpose limits below.
     context_message_limit: int = field(default_factory=lambda: _int("CONTEXT_MESSAGE_LIMIT", 20))
+    reply_context_message_limit: int = field(default_factory=lambda: _int("REPLY_CONTEXT_MESSAGE_LIMIT", 8))
+    targeted_context_message_limit: int = field(default_factory=lambda: _int("TARGETED_CONTEXT_MESSAGE_LIMIT", 10))
+    complex_context_message_limit: int = field(default_factory=lambda: _int("COMPLEX_CONTEXT_MESSAGE_LIMIT", 20))
+    autonomous_context_message_limit: int = field(default_factory=lambda: _int("AUTONOMOUS_CONTEXT_MESSAGE_LIMIT", 8))
     short_memory_minutes: int = field(default_factory=lambda: _int("SHORT_MEMORY_MINUTES", 30))
     summary_message_interval: int = field(default_factory=lambda: _int("SUMMARY_MESSAGE_INTERVAL", 50))
     summary_time_interval: int = field(default_factory=lambda: _int("SUMMARY_TIME_INTERVAL", 1200))
@@ -103,7 +109,27 @@ class LearningSettings:
     openai_daily_min: int = field(default_factory=lambda: _int("OPENAI_DAILY_MIN", 5))
     openai_daily_max: int = field(default_factory=lambda: _int("OPENAI_DAILY_MAX", 7))
     openai_timeout: float = field(default_factory=lambda: _float("OPENAI_TIMEOUT", 20.0))
+    # XAI_MODEL remains a backwards-compatible alias for the reply model.
     xai_model: str = field(default_factory=lambda: os.getenv("XAI_MODEL", "grok-4.5"))
+    xai_reply_model: str = field(default_factory=lambda: os.getenv(
+        "XAI_REPLY_MODEL", os.getenv("XAI_MODEL", "grok-4.5")
+    ))
+    # A summary is deterministic compression, so its default is deliberately
+    # cheaper than the conversational model.  It remains configurable because
+    # xAI model availability can differ between accounts/regions.
+    xai_summary_model: str = field(default_factory=lambda: os.getenv(
+        "XAI_SUMMARY_MODEL", "grok-4.3"
+    ))
+    xai_reply_reasoning_effort: str = field(default_factory=lambda: os.getenv(
+        "XAI_REPLY_REASONING_EFFORT", "low"
+    ).strip().casefold())
+    xai_summary_reasoning_effort: str = field(default_factory=lambda: os.getenv(
+        "XAI_SUMMARY_REASONING_EFFORT", "none"
+    ).strip().casefold())
+    reply_max_output_tokens: int = field(default_factory=lambda: _int("REPLY_MAX_OUTPUT_TOKENS", 100))
+    autonomous_max_output_tokens: int = field(default_factory=lambda: _int("AUTONOMOUS_MAX_OUTPUT_TOKENS", 90))
+    meme_max_output_tokens: int = field(default_factory=lambda: _int("MEME_MAX_OUTPUT_TOKENS", 50))
+    summary_max_output_tokens: int = field(default_factory=lambda: _int("SUMMARY_MAX_OUTPUT_TOKENS", 240))
     xai_base_url: str = field(default_factory=lambda: os.getenv("XAI_BASE_URL", "https://api.x.ai/v1"))
     xai_timeout: float = field(default_factory=lambda: _float("XAI_TIMEOUT", 60.0))
     gif_enabled: bool = field(default_factory=lambda: _bool("GIF_ENABLED", True))
@@ -119,7 +145,7 @@ class LearningSettings:
     media_cooldown: int = field(default_factory=lambda: _int("MEDIA_COOLDOWN", 600))
     meme_render_cooldown: int = field(default_factory=lambda: _int("MEME_RENDER_COOLDOWN", 1800))
     media_template_cooldown: int = field(default_factory=lambda: _int("MEDIA_TEMPLATE_COOLDOWN", 3600))
-    manual_meme_cooldown: int = field(default_factory=lambda: _int("MANUAL_MEME_COOLDOWN", 120))
+    manual_meme_cooldown: int = field(default_factory=lambda: _int("MANUAL_MEME_COOLDOWN", 300))
     media_recent_limit: int = field(default_factory=lambda: _int("MEDIA_RECENT_LIMIT", 12))
     meme_quote_max_chars: int = field(default_factory=lambda: _int("MEME_QUOTE_MAX_CHARS", 140))
     meme_quote_hard_limit: int = field(default_factory=lambda: _int("MEME_QUOTE_HARD_LIMIT", 600))
@@ -147,3 +173,13 @@ class LearningSettings:
     state_topic_min_occurrences: int = field(default_factory=lambda: _int("STATE_TOPIC_MIN_OCCURRENCES", 2))
     state_topic_min_messages: int = field(default_factory=lambda: _int("STATE_TOPIC_MIN_MESSAGES", 2))
     policy_burst_probability_cap: float = field(default_factory=lambda: _float("POLICY_BURST_PROBABILITY_CAP", 0.48))
+
+    def __post_init__(self):
+        # Preserve callers that configured the former single field in Python,
+        # while allowing XAI_REPLY_MODEL to take precedence in deployments.
+        if (
+            "XAI_REPLY_MODEL" not in os.environ
+            and self.xai_reply_model == "grok-4.5"
+            and self.xai_model != "grok-4.5"
+        ):
+            object.__setattr__(self, "xai_reply_model", self.xai_model)

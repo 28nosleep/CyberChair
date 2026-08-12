@@ -80,6 +80,9 @@ class LearningService:
             self.llm_provider = self.providers[settings.llm_provider.strip().casefold()]
             self.openai = self.providers["openai"]
             self.grok = self.providers["grok"]
+        for provider in self.providers.values():
+            if hasattr(provider, "_usage_recorder") or provider.__class__.__module__.startswith("learning."):
+                provider._usage_recorder = self._record_llm_usage
         self.memory = MemoryService(
             settings, self.llm_provider, self._speaker_name,
             provider_resolver=self.provider_for_chat,
@@ -344,9 +347,35 @@ class LearningService:
     def llm_allowed(self, chat_id):
         return self.openai_allowed(chat_id)
 
-    def _dialogue_context(self, chat_id, context=None, max_chars=5000):
+    def _record_llm_usage(self, chat_id, provider, model, call_type, usage):
+        self.repository(chat_id).record_llm_call(provider, model, call_type, usage)
+
+    def llm_cost_diagnostics(self, chat_id, hours=24, current=None):
+        current = current or datetime.now(timezone.utc)
+        since = (current - timedelta(hours=hours)).astimezone(timezone.utc).isoformat()
+        return self.repository(chat_id).llm_usage_report(since)
+
+    def _context_budget(self, purpose, context, chat_state):
+        if purpose == "voice_story":
+            return 0, 0
+        if purpose == "autonomous":
+            return self.settings.autonomous_context_message_limit, 2600
+        conversation_type = getattr(chat_state, "conversation_type", "")
+        complex_turn = conversation_type in {"serious", "work", "argument"} and (
+            bool(context and "?" in context) or len(context or "") > 260
+        )
+        if complex_turn:
+            return self.settings.complex_context_message_limit, 5000
+        if context:
+            return self.settings.targeted_context_message_limit, 3200
+        return self.settings.reply_context_message_limit, 2600
+
+    def _dialogue_context(self, chat_id, context=None, max_chars=5000,
+                          max_messages=None, chat_state=None):
         return self.memory.short_term_context(
-            self.repository(chat_id), context, max_chars
+            self.repository(chat_id), context, max_chars, max_messages,
+            getattr(chat_state, "dominant_topic", None),
+            getattr(chat_state, "conversation_type", None),
         )
 
     def generate_llm(
@@ -366,6 +395,9 @@ class LearningService:
         ).hexdigest()[:32]
         repository = self.repository(chat_id)
         day_summary = repository.summary_for_day(self.memory.logical_day())
+        context_limit, context_chars = self._context_budget(
+            purpose, context, chat_state
+        )
         selection = self.persona.build_request(
             chat_id=chat_id,
             context=context,
@@ -374,13 +406,18 @@ class LearningService:
             history=(
                 None
                 if purpose == "voice_story"
-                else self._dialogue_context(chat_id, context)
+                else self._dialogue_context(
+                    chat_id, context, context_chars, context_limit, chat_state
+                )
             ),
             conversation_decision=conversation_decision,
             chat_state=chat_state,
             troll_mode=self.troll_mode(chat_id),
             day_summary=day_summary,
-            stable_memory=repository.stable_memories(20),
+            stable_memory=self.memory.relevant_memory(
+                repository, context, getattr(chat_state, "dominant_topic", None),
+                getattr(chat_state, "conversation_type", None),
+            )["stable_chat_memory"],
         )
         result = self.provider_for_chat(chat_id).generate(selection.request)
         max_words = 70 if purpose == "voice_story" else 18 if purpose == "creator" else 45

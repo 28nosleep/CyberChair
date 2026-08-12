@@ -5,6 +5,7 @@ from .responses_provider import ResponsesLLMProvider
 
 class OpenAIGenerator(ResponsesLLMProvider):
     provider_label = "OpenAI"
+    provider_key = "openai"
 
     def __init__(self, settings, client=None):
         self.settings = settings
@@ -40,6 +41,9 @@ class OpenAIGenerator(ResponsesLLMProvider):
             "safety_identifier": request.safety_identifier,
             "store": False,
         }
+
+    def _model_for_request(self, request):
+        return self.settings.openai_model
 
 
 __all__ = ["OpenAIGenerator"]

@@ -15,7 +15,7 @@ class GenerateRequest:
 class SummarizeRequest:
     instructions: str
     input: str
-    max_output_tokens: int = 500
+    max_output_tokens: int = 240
     safety_identifier: str | None = None
     metadata: dict[str, Any] | None = None
 

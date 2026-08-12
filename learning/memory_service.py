@@ -73,7 +73,47 @@ class MemoryService:
     def logical_day(self, current=None):
         return (current or self._now()).astimezone(self._timezone).date().isoformat()
 
-    def short_term_context(self, repository, context=None, max_chars=5000):
+    @staticmethod
+    def _relevant_values(values, terms, limit=2):
+        result = []
+        for value in values or ():
+            clean = normalize_spaces(str(value))[:200]
+            value_terms = set(re.findall(r"[\wёЁ-]{4,}", clean.casefold()))
+            if clean and terms and value_terms & terms:
+                result.append(clean)
+            if len(result) >= limit:
+                break
+        return result
+
+    def relevant_memory(self, repository, context=None, dominant_topic=None,
+                        conversation_type=None):
+        """Select facts that can affect this turn instead of serialising all memory."""
+        seed = f"{context or ''} {dominant_topic or ''}"
+        terms = set(re.findall(r"[\wёЁ-]{4,}", seed.casefold()))
+        summary = normalize_summary(repository.summary_for_day(self.logical_day()) or {})
+        relevant_summary = {}
+        for key in (
+            "main_topics", "active_conflicts", "inside_jokes",
+            "frequently_mentioned_people", "notable_events", "repeated_phrases",
+            "callback_jokes",
+        ):
+            selected = self._relevant_values(summary.get(key), terms)
+            if selected:
+                relevant_summary[key] = selected
+        # Mood only changes a reply when this is clearly a mood/topic match.
+        mood = summary.get("current_mood", "")
+        if mood and terms & set(re.findall(r"[\wёЁ-]{4,}", mood.casefold())):
+            relevant_summary["current_mood"] = mood
+        return {
+            "day_summary": relevant_summary or None,
+            "stable_chat_memory": self._relevant_values(
+                repository.stable_memories(20), terms
+            ),
+        }
+
+    def short_term_context(self, repository, context=None, max_chars=5000,
+                           max_messages=None, dominant_topic=None,
+                           conversation_type=None):
         rows = self.short_term_rows(repository)
         terms = set(re.findall(r"[\wёЁ-]{4,}", (context or "").casefold()))
         scored = []
@@ -82,7 +122,11 @@ class MemoryService:
             score = len(terms & row_terms) * 10 + position / max(1, len(rows))
             scored.append((score, position, row))
         selected = sorted(
-            sorted(scored, reverse=True)[: min(20, self.settings.context_message_limit)],
+            sorted(scored, reverse=True)[: min(
+                max_messages or self.settings.context_message_limit,
+                self.settings.context_message_limit,
+                20,
+            )],
             key=lambda item: item[1],
         )
         lines = []
@@ -96,11 +140,9 @@ class MemoryService:
                 continue
             lines.append(line)
             length += len(line)
-        day_summary = repository.summary_for_day(self.logical_day())
-        memory = {
-            "day_summary": normalize_summary(day_summary) if day_summary else None,
-            "stable_chat_memory": repository.stable_memories(20),
-        }
+        memory = self.relevant_memory(
+            repository, context, dominant_topic, conversation_type
+        )
         header = "Сжатая память чата: " + json.dumps(
             memory, ensure_ascii=False, separators=(",", ":")
         )[:2200]
@@ -176,8 +218,15 @@ class MemoryService:
         safety_identifier = __import__("hashlib").sha256(
             f"cyberchair-memory:{chat_id}".encode("utf-8")
         ).hexdigest()[:32]
-        request = build_summarize_request(dialogue, previous, safety_identifier)
-        summary = provider.summarize(replace(request, metadata={"chat_id": chat_id}))
+        if not dialogue.strip():
+            return False
+        request = build_summarize_request(
+            dialogue, previous, safety_identifier,
+            max_output_tokens=self.settings.summary_max_output_tokens,
+        )
+        summary = provider.summarize(replace(request, metadata={
+            "chat_id": chat_id, "call_type": "summary", "purpose": "summary",
+        }))
         if not summary:
             return False
         legacy_candidates = (

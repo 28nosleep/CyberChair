@@ -29,7 +29,7 @@ class FakeResponses:
         output = self.outputs.pop(0)
         if isinstance(output, Exception):
             raise output
-        return SimpleNamespace(output_text=output)
+        return output if hasattr(output, "output_text") else SimpleNamespace(output_text=output)
 
 
 class FakeClient:
@@ -63,6 +63,53 @@ class GrokProviderTests(unittest.TestCase):
         self.assertEqual(result["main_topics"], ["релиз"])
         self.assertEqual(result["callback_jokes"], ["принтер"])
         self.assertFalse(client.responses.calls[0]["store"])
+
+    def test_grok_uses_low_reasoning_cache_key_and_separate_summary_model(self):
+        client = FakeClient("обычная реплика", json.dumps({
+            "main_topics": [], "current_mood": "", "active_conflicts": [],
+            "inside_jokes": [], "frequently_mentioned_people": [],
+            "notable_events": [], "repeated_phrases": [], "callback_jokes": [],
+            "memory_candidates": [],
+        }))
+        provider = GrokProvider(self.settings(
+            xai_reply_model="grok-reply", xai_summary_model="grok-summary",
+        ), client)
+        provider.generate(GenerateRequest("persona", "target", 120, metadata={
+            "chat_id": -1, "call_type": "reply",
+        }))
+        provider.summarize(SummarizeRequest("summary", "fragment", metadata={
+            "chat_id": -1, "call_type": "summary",
+        }))
+        reply, summary = client.responses.calls
+        self.assertEqual(reply["model"], "grok-reply")
+        self.assertEqual(reply["reasoning"], {"effort": "low"})
+        self.assertEqual(reply["extra_body"]["prompt_cache_key"], "cyberchair:persona:v2")
+        self.assertEqual(summary["model"], "grok-summary")
+        self.assertEqual(summary["reasoning"], {"effort": "none"})
+        self.assertEqual(summary["extra_body"]["prompt_cache_key"], "cyberchair:summary:v1")
+        self.assertTrue(summary["text"]["format"]["strict"])
+
+    def test_usage_is_recorded_without_prompt_or_secret(self):
+        usage = SimpleNamespace(
+            input_tokens=140,
+            input_tokens_details=SimpleNamespace(cached_tokens=100),
+            output_tokens=22,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=9),
+            cost_in_usd_ticks=1234567,
+        )
+        response = SimpleNamespace(output_text="живая хуйня по теме", usage=usage)
+        client = FakeClient(response)
+        with tempfile.TemporaryDirectory() as directory:
+            service = LearningService(self.settings(data_dir=Path(directory), openai_chat_id=-1), xai_client=client)
+            self.assertEqual(service.generate_llm(-1, "что с релизом", "reply"), "живая хуйня по теме")
+            report = service.llm_cost_diagnostics(-1)
+        item = report["groups"]["reply"]
+        self.assertEqual(item["calls"], 1)
+        self.assertEqual(item["input_tokens"], 140)
+        self.assertEqual(item["cached_input_tokens"], 100)
+        self.assertEqual(item["output_tokens"], 22)
+        self.assertEqual(item["reasoning_tokens"], 9)
+        self.assertEqual(item["cost_usd_ticks"], 1234567)
 
     def test_key_never_appears_in_repr_log_or_error(self):
         secret = "xai-secret-do-not-print"

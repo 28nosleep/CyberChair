@@ -29,7 +29,8 @@ def build_generate_request(
     ).request
 
 
-def build_summarize_request(dialogue, previous_summary=None, safety_identifier=None):
+def build_summarize_request(dialogue, previous_summary=None, safety_identifier=None,
+                            max_output_tokens=240):
     prompt = (
         "Сожми фрагмент чата в JSON-память. Не цитируй сообщения целиком и не сохраняй "
         "секреты, контакты или одноразовые детали. Верни только компактный JSON с ключами: "
@@ -48,5 +49,6 @@ def build_summarize_request(dialogue, previous_summary=None, safety_identifier=N
     return SummarizeRequest(
         instructions="Ты модуль сжатия памяти. Отвечай валидным JSON без markdown.",
         input=prompt,
+        max_output_tokens=max_output_tokens,
         safety_identifier=safety_identifier,
     )

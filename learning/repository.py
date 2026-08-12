@@ -158,7 +158,31 @@ class ChatRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_media_usage_created
                     ON media_usage(created_at DESC);
+                CREATE TABLE IF NOT EXISTS llm_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    call_type TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    cached_input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    cost_usd_ticks INTEGER,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_calls_created
+                    ON llm_calls(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_llm_calls_type_created
+                    ON llm_calls(call_type, created_at DESC);
             """)
+            llm_call_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(llm_calls)")
+            }
+            if "chat_id" not in llm_call_columns:
+                db.execute(
+                    "ALTER TABLE llm_calls ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0"
+                )
             # One-time/boot migration for databases created by versions that
             # retained a large transcript. Preserve the aggregate count, then
             # keep only the newest short-memory window.
@@ -408,6 +432,76 @@ class ChatRepository:
                 "INSERT INTO chat_stats(key, value) VALUES('last_bot_reply_at', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (stamp,)
             )
+
+    def record_llm_call(self, provider, model, call_type, usage, created_at=None):
+        """Persist API metering only; prompts, output text and secrets never enter it."""
+        stamp = (created_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        values = usage or {}
+
+        def integer(name):
+            value = values.get(name)
+            try:
+                return int(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO llm_calls(
+                    chat_id, provider, model, call_type, input_tokens, cached_input_tokens,
+                    output_tokens, reasoning_tokens, cost_usd_ticks, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    self.chat_id, str(provider), str(model), str(call_type),
+                    integer("input_tokens"), integer("cached_input_tokens"),
+                    integer("output_tokens"), integer("reasoning_tokens"),
+                    integer("cost_usd_ticks"), stamp,
+                ),
+            )
+
+    def llm_usage_report(self, since_iso):
+        """Return exact local usage totals, grouped for developer diagnostics."""
+        with self._lock, closing(self._connect()) as db, db:
+            rows = db.execute(
+                """SELECT call_type, COUNT(*) AS calls,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                    SUM(cost_usd_ticks) AS cost_usd_ticks
+                FROM llm_calls WHERE created_at >= ? GROUP BY call_type""",
+                (since_iso,),
+            ).fetchall()
+            chats = db.execute(
+                "SELECT COUNT(DISTINCT substr(created_at, 1, 10)) FROM llm_calls WHERE created_at >= ?",
+                (since_iso,),
+            ).fetchone()[0]
+        groups = {
+            key: {
+                "calls": 0, "input_tokens": 0, "cached_input_tokens": 0,
+                "output_tokens": 0, "reasoning_tokens": 0,
+                "cost_usd_ticks": None,
+            }
+            for key in ("reply", "summary", "autonomous", "meme")
+        }
+        for row in rows:
+            key = row["call_type"] if row["call_type"] in groups else "reply"
+            groups[key] = dict(row)
+        totals = {
+            key: sum(group[key] or 0 for group in groups.values())
+            for key in ("calls", "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens")
+        }
+        known_costs = [group["cost_usd_ticks"] for group in groups.values() if group["cost_usd_ticks"] is not None]
+        totals["cost_usd_ticks"] = sum(known_costs) if known_costs else None
+        totals["avg_cost_usd_ticks"] = (
+            totals["cost_usd_ticks"] // totals["calls"]
+            if totals["cost_usd_ticks"] is not None and totals["calls"] else None
+        )
+        # This repository represents one Telegram chat.  Keep the field in the
+        # report shape so a future all-chat aggregator can sum it unchanged.
+        totals["active_chats"] = 1 if totals["calls"] else 0
+        totals["avg_cost_per_chat_day_usd_ticks"] = totals["cost_usd_ticks"]
+        return {"groups": groups, "total": totals}
 
     def generated_since(self, since_iso, kind=None):
         query = "SELECT text, kind, created_at FROM generated WHERE created_at >= ?"

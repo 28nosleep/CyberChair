@@ -235,6 +235,26 @@ class CharacterizationTests(unittest.TestCase):
         bot = self._run_scheduler_at(current)
         bot.send_message.assert_not_called()
 
+    def test_scheduler_sends_one_formatted_movie_quote_at_selected_minute(self):
+        import scheduler as scheduler_module
+
+        current = datetime(2026, 8, 11, 12, 15, tzinfo=ZoneInfo("Europe/Moscow"))
+        scheduler_module._last_quote_event = None
+        fake_bot = Mock()
+        with (
+            patch.object(scheduler_module, "get_now", return_value=current),
+            patch.object(scheduler_module, "is_workday", return_value=True),
+            patch.object(scheduler_module, "daily_quote_minutes", return_value=[12 * 60 + 15]),
+            patch.object(scheduler_module, "movie_quote_message") as quote,
+            patch.object(scheduler_module.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                scheduler_module.scheduler(
+                    fake_bot, -1, "Europe/Moscow", 9, 0, 17, 30,
+                    event_claim_callback=lambda *_: True,
+                )
+        quote.assert_called_once_with(fake_bot, -1)
+
     def test_openai_failure_returns_none_without_local_fallback(self):
         client = SimpleNamespace(responses=FailingResponses())
         service = LearningService(self.settings(), openai_client=client)

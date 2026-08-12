@@ -22,12 +22,48 @@ class ResponsesLLMProvider:
     def _create(self, request):
         return self._get_client().responses.create(**self._response_kwargs(request))
 
+    @staticmethod
+    def _usage_value(value, *path):
+        for part in path:
+            if value is None:
+                return None
+            value = value.get(part) if isinstance(value, dict) else getattr(value, part, None)
+        return value
+
+    def _record_usage(self, request, response):
+        """Emit usage only; the recorder never receives prompts or API keys."""
+        recorder = getattr(self, "_usage_recorder", None)
+        metadata = request.metadata or {}
+        chat_id = metadata.get("chat_id")
+        if not recorder or chat_id is None:
+            return
+        usage = getattr(response, "usage", None)
+        payload = {
+            "input_tokens": self._usage_value(usage, "input_tokens"),
+            "cached_input_tokens": self._usage_value(usage, "input_tokens_details", "cached_tokens"),
+            "output_tokens": self._usage_value(usage, "output_tokens"),
+            "reasoning_tokens": self._usage_value(usage, "output_tokens_details", "reasoning_tokens"),
+            "cost_usd_ticks": self._usage_value(usage, "cost_in_usd_ticks"),
+        }
+        try:
+            recorder(
+                chat_id,
+                getattr(self, "provider_key", self.provider_label.casefold()),
+                self._model_for_request(request),
+                metadata.get("call_type", "reply"),
+                payload,
+            )
+        except Exception:
+            # Metering must never make the live response unavailable.
+            log.warning("%s usage accounting failed", self.provider_label)
+
     def generate(self, request):
         if not self.available:
             log.warning("%s unavailable: %s", self.provider_label, self.unavailable_reason)
             return None
         try:
             response = self._create(request)
+            self._record_usage(request, response)
             cleaned_lines = []
             for raw_line in response.output_text.splitlines():
                 line = re.sub(r"\[[^\]\n]{1,60}\]\s*", "", raw_line)
@@ -57,6 +93,7 @@ class ResponsesLLMProvider:
             return None
         try:
             response = self._create(request)
+            self._record_usage(request, response)
             raw = response.output_text.strip()
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
             data = json.loads(raw)

@@ -267,10 +267,18 @@ class MediaServiceTests(unittest.TestCase):
         self.assertIsNone(learning.startup_meme())
 
     def test_catalog_is_data_driven_and_versioned(self):
-        self.assertEqual(self.catalog.version, "2.2.0")
-        self.assertGreaterEqual(len(self.catalog.assets), 17)
+        self.assertEqual(self.catalog.version, "2.3.0")
+        self.assertGreaterEqual(len(self.catalog.assets), 20)
         self.assertTrue(all(asset.contexts and asset.tags and asset.source_url for asset in self.catalog.assets))
         self.assertTrue(all(self.catalog.resolve(asset).is_file() for asset in self.catalog.assets))
+
+    def test_user_provided_kucher_and_pepe_templates_render(self):
+        renderer = MemeRenderer(self.catalog, self.root / "rendered")
+        for asset_id in ("kucher_smirk", "pepe_tracksuit", "kucher_scream"):
+            result = renderer.render(asset_id, "пятничный деплой — канон ивент")
+            self.assertIsNotNone(result, asset_id)
+            self.assertEqual(result.render_profile, "top_caption")
+            renderer.cleanup(result)
 
 
 class MemeRendererTests(unittest.TestCase):
