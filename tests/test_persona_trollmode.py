@@ -98,10 +98,15 @@ class PersonaAndTrollModeTests(unittest.TestCase):
 
     def test_meme_caption_is_short_and_has_no_emoji(self):
         request = self.build(purpose="meme_caption").request
-        self.assertIn("3–8 слов", request.input)
+        self.assertIn("3–10 слов", request.input)
         self.assertIn("без emoji", request.input)
         self.assertEqual(request.max_output_tokens, 30)
         self.assertIn("не заканчивай ими сообщения автоматически", request.instructions)
+
+    def test_high_intensity_requires_real_meme_slang_layer(self):
+        request = self.build(conversation_decision=decision(.75)).request
+        self.assertIn("обязательно используй 1–2", request.instructions)
+        self.assertIn("сойджак", request.instructions)
 
     def test_troll_mode_off_uses_neutral_persona(self):
         result = self.build(troll_mode=False)

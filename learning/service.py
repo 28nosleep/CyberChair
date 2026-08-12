@@ -18,6 +18,7 @@ from .media_service import MediaDecision, MediaService
 from .memory_service import MemoryService
 from .meme_lexicon import MemeLexicon
 from .meme_renderer import MemeRenderer
+from .meme_sources import MemeSource, MemeSourceSelector
 from .persona import PersonaBuilder
 from .preprocessing import (
     FOREIGN_BOT_COMMAND_RE,
@@ -93,6 +94,7 @@ class LearningService:
         self.meme_renderer = MemeRenderer(
             self.media_catalog, self.settings.data_dir / "generated_media"
         )
+        self.meme_sources = MemeSourceSelector(self.rng)
         self._last_policy_target_user = {}
         self._policy_target_streak = {}
         self._policy_answered_messages = {}
@@ -103,6 +105,7 @@ class LearningService:
         self._models = OrderedDict()
         self._model_counts = {}
         self._voice_cooldown_notices = {}
+        self._command_meme_sources = {}
         self._clock = clock or time.monotonic
         self._lock = threading.RLock()
 
@@ -972,6 +975,7 @@ class LearningService:
         repository.set_setting("startup_meme_v1", "1")
 
     def meme_command_on_cooldown(self, chat_id):
+        """Whether the *AI caption* path is cooling down, not the command."""
         since = (
             datetime.now(timezone.utc)
             - timedelta(seconds=self.settings.manual_meme_cooldown)
@@ -979,15 +983,29 @@ class LearningService:
         return bool(self.repository(chat_id).generated_since(since, "manual_meme"))
 
     def maybe_command_meme(self, chat_id):
-        """Build an AI caption and choose a local template for ``с м стул``."""
-        if (
-            not self.troll_mode(chat_id)
-            or not self.media_enabled(chat_id)
-            or self.meme_command_on_cooldown(chat_id)
-            or not self.provider_available(chat_id)
-        ):
+        """Always make a meme; AI cooldown only switches its caption source."""
+        if not self.media_enabled(chat_id):
             return None
-        caption = self.generate_openai(chat_id, None, "meme_caption")
+        repository = self.repository(chat_id)
+        rows = repository.meme_source_messages()
+        summary = repository.summary_for_day(self.memory.logical_day()) or {}
+        callbacks = self.persona.select_callbacks(
+            summary, repository.stable_memories(20), "", None
+        )
+        ai_ready = (
+            self.troll_mode(chat_id)
+            and self.provider_available(chat_id)
+            and not self.meme_command_on_cooldown(chat_id)
+        )
+        source = self.meme_sources.choose(
+            chat_id, rows, callbacks, fallback=not ai_ready
+        )
+        caption = None
+        if ai_ready:
+            context = source.text or None
+            caption = self.generate_openai(chat_id, context, "meme_caption")
+        if not caption:
+            source, caption = self._local_command_caption(chat_id, source, rows, callbacks)
         if not caption:
             return None
         candidates = [
@@ -996,13 +1014,50 @@ class LearningService:
         ]
         if not candidates:
             return None
-        asset = self.rng.choice(candidates)
-        return MediaDecision(
+        unused = [asset for asset in candidates if asset.id not in self.meme_sources.recent_templates(chat_id)]
+        asset = self.rng.choice(unused or candidates)
+        decision = MediaDecision(
             action="meme", asset_id=asset.id, template_id=asset.id,
-            caption_text=caption, confidence=1.0, reason="manual_ai_meme",
+            source_message_id=source.message_id, caption_text=caption, confidence=1.0,
+            reason=f"manual_{'ai' if ai_ready else 'local'}_{source.kind}",
             asset_key=asset.id, cooldown_group=asset.cooldown_group,
             archetype=asset.archetype,
         )
+        self._command_meme_sources[decision] = source
+        return decision
+
+    def _local_command_caption(self, chat_id, source, rows, callbacks):
+        """Local cascade: real old quote → fresh → callback → rare Markov → phrase."""
+        if source.kind in {"old", "fresh", "callback"} and source.text:
+            return source, self._caption_from_source(source)
+        if self.meme_sources.markov_allowed(chat_id):
+            brainrot = self.generate_local(chat_id, None)
+            if brainrot:
+                return MemeSource("markov", brainrot), self._caption_from_source(
+                    MemeSource("markov", brainrot)
+                )
+        phrases = (
+            "chairOS фиксирует промышленный скилл ишью",
+            "минус аура, протокол брейнрота активирован",
+            "лил бро выбрал сайдквест вместо жизни",
+            "сканирование завершено: проект кукд",
+        )
+        phrase = self.rng.choice(phrases)
+        return MemeSource("phrase", phrase), phrase
+
+    def _caption_from_source(self, source):
+        text = normalize_spaces(source.text)[:110]
+        if source.kind == "callback":
+            return f"{text} — канон ивент"
+        if source.kind == "markov":
+            return f"{text} — пошёл брейнрот"
+        tails = (
+            "минус аура зафиксирована",
+            "лил бро ларпит сигму",
+            "chairOS фиксирует скилл ишью",
+            "сойджак-комиссия уже выехала",
+        )
+        return f"{text} — {self.rng.choice(tails)}"
 
     def mark_command_meme_sent(self, chat_id, decision):
         if not isinstance(decision, MediaDecision):
@@ -1010,6 +1065,15 @@ class LearningService:
         repository = self.repository(chat_id)
         self.media.commit(repository, decision)
         repository.record_generated(decision.template_id or "manual_meme", "manual_meme")
+        source = self._command_meme_sources.pop(
+            decision,
+            MemeSource((decision.reason or "").rsplit("_", 1)[-1], "", decision.source_message_id),
+        )
+        self.meme_sources.record(
+            chat_id, source, decision.template_id,
+        )
+        if source.kind in {"old", "fresh"} and source.text:
+            repository.mark_used([source.text])
 
     def cleanup_rendered_meme(self, result):
         self.meme_renderer.cleanup(result)
@@ -1026,4 +1090,6 @@ class LearningService:
             self._last_conversation_decision.pop(chat_id, None)
             self._last_autonomous_decision.pop(chat_id, None)
             self.persona.clear_chat(chat_id)
+            self.meme_sources.clear_chat(chat_id)
+            self._command_meme_sources.clear()
         log.info("Chat learning database cleared chat=%s", chat_id)

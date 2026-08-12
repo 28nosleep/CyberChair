@@ -1038,13 +1038,10 @@ def handle_message(message):
         return
 
     if CHAIR_MEME_COMMAND_RE.fullmatch(text):
-        if learning_service.meme_command_on_cooldown(message.chat.id):
-            bot.reply_to(message, "🪑 мем на кулдауне")
-            return
         decision = learning_service.maybe_command_meme(message.chat.id)
         if decision and send_manual_meme(message, decision):
             return
-        bot.reply_to(message, "🪑 мем не сгенерировался")
+        logging.getLogger(__name__).warning("Не удалось собрать мем по команде chat=%s", message.chat.id)
         return
 
     if CHAIR_REMAINING_COMMAND_RE.fullmatch(text):

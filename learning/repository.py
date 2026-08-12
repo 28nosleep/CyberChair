@@ -276,6 +276,18 @@ class ChatRepository:
             rows = db.execute("SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def meme_source_messages(self, limit=5000):
+        """Human quotes plus reply engagement, for deterministic meme ranking."""
+        with self._lock, closing(self._connect()) as db, db:
+            rows = db.execute(
+                """SELECT m.*, COUNT(r.id) AS reply_count
+                FROM messages AS m
+                LEFT JOIN messages AS r ON r.reply_to_message_id = m.message_id
+                GROUP BY m.id ORDER BY m.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def recent_activity_count(self, since_iso):
         with self._lock, closing(self._connect()) as db, db:
             return db.execute("SELECT COUNT(*) FROM messages WHERE created_at >= ?", (since_iso,)).fetchone()[0]
