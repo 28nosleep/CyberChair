@@ -24,6 +24,13 @@ from .meme_lexicon import MemeLexicon
 from .meme_renderer import MemeRenderer
 from .meme_sources import MemeSource, MemeSourceSelector
 from .persona import PersonaBuilder
+from .pending_conversation import (
+    PendingConversation,
+    expected_answer_type,
+    extract_clarification,
+    looks_like_continuation,
+    pending_mode,
+)
 from .preprocessing import (
     FOREIGN_BOT_COMMAND_RE,
     VOICE_STORY_COMMAND_RE,
@@ -36,6 +43,19 @@ from .provider_factory import create_llm_provider, create_llm_providers
 from .triggers import TriggerEngine
 
 log = logging.getLogger(__name__)
+
+
+PROVIDER_REFUSAL_RE = re.compile(
+    r"^(?:извините[,! ]*)?(?:я\s+)?(?:не\s+могу|не\s+стану|не\s+буду)\s+"
+    r"(?:помочь|поддержать|выполнить|ответить|участвовать|продолжить)|"
+    r"^(?:давайте|пожалуйста)\s+(?:сохранять|поддерживать)\s+уважительн",
+    re.I,
+)
+
+
+def looks_like_provider_refusal(text):
+    """Recognize a provider refusal so normal routing can use its local fallback."""
+    return bool(PROVIDER_REFUSAL_RE.search(normalize_spaces(text or "")))
 
 SUBSCRIPTION_REQUIRED = (
     "🔒 OpenAI-модуль Киберстула доступен только в основном чате. "
@@ -514,6 +534,9 @@ class LearningService:
         if result and self._chair_call_meta_joke_on_cooldown(chat_id, result):
             log.info("Repeated chair-call meta joke blocked chat=%s", chat_id)
             return None
+        if result and looks_like_provider_refusal(result):
+            log.info("Provider refusal routed to local fallback chat=%s", chat_id)
+            return None
         if result and self._valid(result, context, chat_id=chat_id, max_words=max_words):
             self.persona.record_usage(
                 chat_id, selection.meme_ids, selection.cooldown_groups
@@ -591,7 +614,142 @@ class LearningService:
             f"direct_{route}",
         )
         self._remember_policy_target(chat_id, message)
+        if isinstance(result, str):
+            self._store_pending_from_response(message, result, "substantive")
         return result
+
+    def _store_pending_from_response(self, message, response, intent):
+        clarification = extract_clarification(response)
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        if clarification is None or user_id is None:
+            return False
+        self.repository(message.chat.id).save_pending_conversation(
+            user_id=user_id,
+            original_message_id=getattr(message, "message_id", getattr(message, "id", None)),
+            original_question=normalize_spaces(getattr(message, "text", "") or ""),
+            clarification_question=clarification,
+            intent=intent,
+            context=normalize_spaces(response),
+            expected_type=expected_answer_type(clarification),
+            pending_mode=pending_mode(response, clarification),
+        )
+        return True
+
+    def pending_conversation(self, chat_id, user_id, current=None):
+        row = self.repository(chat_id).pending_conversation(
+            user_id, self.settings.pending_conversation_ttl_seconds, current,
+        )
+        if not row:
+            return None
+        created = self._as_utc(row["created_at"])
+        return PendingConversation(
+            chat_id=row["chat_id"], user_id=row["user_id"],
+            bot_message_id=row["bot_message_id"],
+            original_message_id=row["original_message_id"],
+            original_question=row["original_question"],
+            clarification_question=row["clarification_question"],
+            intent=row["intent"], context=row["context"],
+            expected_type=row["expected_type"], mode=row["pending_mode"],
+            created_at=created,
+        )
+
+    def attach_pending_bot_message(self, incoming_message, sent_message):
+        user_id = getattr(getattr(incoming_message, "from_user", None), "id", None)
+        bot_message_id = getattr(sent_message, "message_id", getattr(sent_message, "id", None))
+        if user_id is None or not isinstance(bot_message_id, int):
+            return False
+        self.repository(incoming_message.chat.id).attach_pending_bot_message(
+            user_id, bot_message_id
+        )
+        return True
+
+    def is_pending_continuation(self, message, bot_id=None, current=None):
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        if user_id is None:
+            return False
+        pending = self.pending_conversation(message.chat.id, user_id, current)
+        if pending is None:
+            return False
+        reply = getattr(message, "reply_to_message", None)
+        reply_id = getattr(reply, "message_id", getattr(reply, "id", None))
+        reply_user = getattr(reply, "from_user", None)
+        strong_reply = bool(
+            reply
+            and (
+                pending.bot_message_id is not None
+                and reply_id == pending.bot_message_id
+                or bot_id is not None
+                and reply_user is not None
+                and getattr(reply_user, "id", None) == bot_id
+            )
+        )
+        return strong_reply or looks_like_continuation(
+            getattr(message, "text", ""), pending.expected_type, pending.mode
+        )
+
+    def _local_continuation_fallback(self, pending, answer):
+        if pending.expected_type == "measurements":
+            numbers = [float(value.replace(",", ".")) for value in re.findall(r"\d+(?:[.,]\d+)?", answer)]
+            if len(numbers) >= 2:
+                height, weight = numbers[0], numbers[1]
+                if height > 3:
+                    height /= 100
+                bmi = weight / max(.5, height) ** 2
+                return (
+                    f"при этих данных имт около {bmi:.1f}; стартуй с +250–350 ккал к поддержанию и 110–135 г белка, две недели без роста — докинь ещё 150–200 ккал"
+                )
+        if pending.expected_type == "budget":
+            return f"с бюджетом {normalize_spaces(answer)} уже можно резать варианты по реальной цене; бери лучший по главному сценарию, а не по маркетинговым мегапикселям"
+        if pending.expected_type == "choices":
+            return f"из этих вариантов сначала сравни главный сценарий, цену и что бесит ежедневно; без этого выбор будет чистым глейзингом бренда"
+        return f"принял: {normalize_spaces(answer)}. теперь по исходной теме уже можно отвечать без гадания; chairOS контекст не проебал"
+
+    def maybe_pending_continuation(self, message, bot_id=None, current=None):
+        """Consume one fresh same-user pending turn and produce exactly one reply."""
+        chat_id = message.chat.id
+        if not self._enabled(chat_id, "talk"):
+            return None
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        pending = self.pending_conversation(chat_id, user_id, current) if user_id is not None else None
+        if pending is None or not self.is_pending_continuation(message, bot_id, current):
+            return None
+        repository = self.repository(chat_id)
+        repository.clear_pending_conversation(user_id)
+        repository.record_routing_event("pending_continuations")
+        repository.record_routing_event("intent_substantive")
+        state = self.chat_state_analyzer.analyze(
+            repository, incoming_message=message, bot_id=bot_id,
+            last_target_user_id=self._last_policy_target_user.get(chat_id),
+            answered_message_ids=self._policy_answered_messages.get(chat_id, ()),
+        )
+        conversation = self.conversation_policy.decide(
+            state, addressed=True, local_allowed=True,
+            llm_allowed=self.llm_allowed(chat_id), quiet_hours=False,
+        )
+        self._last_chat_state[chat_id] = state
+        self._last_conversation_decision[chat_id] = conversation
+        answer = normalize_spaces(getattr(message, "text", "") or "")
+        context = (
+            "Продолжение разговора.\n"
+            f"Исходный вопрос пользователя: {pending.original_question[:500]}\n"
+            f"Предыдущий ответ CyberChair: {pending.context[:500]}\n"
+            f"CyberChair запросил: {pending.clarification_question[:180]}\n"
+            f"Новая информация пользователя: {answer[:500]}\n"
+            "Продолжи исходную тему и обязательно ответь по существу; не спрашивай, что означает новая информация."
+        )
+        with self._response_activity(chat_id, "typing", "grok") as action:
+            result = None
+            if self.llm_allowed(chat_id) and self.provider_available(chat_id):
+                result = self.generate_openai(
+                    chat_id, context, "reply",
+                    conversation_decision=conversation, chat_state=state,
+                )
+            if result:
+                return self._record_direct_result(chat_id, message, "grok", result)
+            repository.record_routing_event("grok_fallback_local")
+            result = self._local_continuation_fallback(pending, answer)
+            self._ensure_action_visible(action, "local", result)
+            return self._record_direct_result(chat_id, message, "local", result)
 
     def maybe_direct_reply(self, message, bot_id=None, bot_username=None,
                            explicit_address=False):
@@ -599,6 +757,12 @@ class LearningService:
         chat_id = message.chat.id
         if not self._enabled(chat_id, "talk"):
             return None
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        if user_id is not None:
+            if self.is_pending_continuation(message, bot_id=bot_id):
+                return self.maybe_pending_continuation(message, bot_id=bot_id)
+            # An explicit new turn supersedes stale conversational ambiguity.
+            self.repository(chat_id).clear_pending_conversation(user_id)
         text = message.text or ""
         reply = getattr(message, "reply_to_message", None)
         reply_user = getattr(reply, "from_user", None)
@@ -710,6 +874,7 @@ class LearningService:
                 chat_id, subject, route.intent, repository,
                 self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
                 self.troll_mode(chat_id),
+                conversation.troll_intensity,
             )
             if memes:
                 self.persona.record_usage(

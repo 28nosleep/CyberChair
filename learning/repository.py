@@ -214,6 +214,21 @@ class ChatRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_routing_events_created
                     ON routing_events(created_at DESC);
+                CREATE TABLE IF NOT EXISTS pending_conversations (
+                    user_id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    bot_message_id INTEGER,
+                    original_message_id INTEGER,
+                    original_question TEXT NOT NULL,
+                    clarification_question TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    context TEXT NOT NULL DEFAULT '',
+                    expected_type TEXT NOT NULL DEFAULT 'short_answer',
+                    pending_mode TEXT NOT NULL DEFAULT 'hard',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_created
+                    ON pending_conversations(created_at);
             """)
             llm_call_columns = {
                 row[1] for row in db.execute("PRAGMA table_info(llm_calls)")
@@ -221,6 +236,14 @@ class ChatRepository:
             if "chat_id" not in llm_call_columns:
                 db.execute(
                     "ALTER TABLE llm_calls ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0"
+                )
+            pending_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(pending_conversations)")
+            }
+            if "pending_mode" not in pending_columns:
+                db.execute(
+                    "ALTER TABLE pending_conversations "
+                    "ADD COLUMN pending_mode TEXT NOT NULL DEFAULT 'hard'"
                 )
             # One-time/boot migration for databases created by versions that
             # retained a large transcript. Preserve the aggregate count, then
@@ -406,6 +429,61 @@ class ChatRepository:
     def set_setting(self, key, value):
         with self._lock, closing(self._connect()) as db, db:
             db.execute("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def save_pending_conversation(
+        self, user_id, original_message_id, original_question,
+        clarification_question, intent, context="", expected_type="short_answer",
+        pending_mode="hard",
+        bot_message_id=None, created_at=None,
+    ):
+        stamp = (created_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO pending_conversations(
+                    user_id, chat_id, bot_message_id, original_message_id,
+                    original_question, clarification_question, intent, context,
+                    expected_type, pending_mode, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    bot_message_id=excluded.bot_message_id,
+                    original_message_id=excluded.original_message_id,
+                    original_question=excluded.original_question,
+                    clarification_question=excluded.clarification_question,
+                    intent=excluded.intent, context=excluded.context,
+                    expected_type=excluded.expected_type,
+                    pending_mode=excluded.pending_mode,
+                    created_at=excluded.created_at""",
+                (
+                    int(user_id), self.chat_id, bot_message_id,
+                    original_message_id, str(original_question),
+                    str(clarification_question), str(intent), str(context),
+                    str(expected_type), str(pending_mode), stamp,
+                ),
+            )
+
+    def pending_conversation(self, user_id, ttl_seconds, current=None):
+        current = current or datetime.now(timezone.utc)
+        cutoff = (current - timedelta(seconds=max(1, int(ttl_seconds)))).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute("DELETE FROM pending_conversations WHERE created_at < ?", (cutoff,))
+            row = db.execute(
+                "SELECT * FROM pending_conversations WHERE user_id = ?",
+                (int(user_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def clear_pending_conversation(self, user_id):
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute("DELETE FROM pending_conversations WHERE user_id = ?", (int(user_id),))
+
+    def attach_pending_bot_message(self, user_id, bot_message_id):
+        if bot_message_id is None:
+            return
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                "UPDATE pending_conversations SET bot_message_id = ? WHERE user_id = ?",
+                (int(bot_message_id), int(user_id)),
+            )
 
     def claim_scheduled_event(self, event_key):
         """Atomically reserve a scheduler slot across restarts and processes."""
@@ -1104,6 +1182,7 @@ class ChatRepository:
             db.execute("DELETE FROM media_metadata")
             db.execute("DELETE FROM media_usage")
             db.execute("DELETE FROM routing_events")
+            db.execute("DELETE FROM pending_conversations")
             db.execute(
                 "INSERT OR REPLACE INTO summary_state(singleton, last_message_row_id, "
                 "last_summary_at, pending_since) VALUES(1, 0, NULL, NULL)"

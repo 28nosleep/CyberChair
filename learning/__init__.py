@@ -17,6 +17,7 @@ from .service import LearningService
 from .settings import LearningSettings
 from .direct_address import DirectAddressRouter, LocalIntentClassifier, ResponseDecision
 from .local_responder import LocalResponder
+from .pending_conversation import PendingConversation
 from .chat_action import ChatActionManager, MEDIA_CHAT_ACTIONS
 
 __all__ = [
@@ -48,6 +49,7 @@ __all__ = [
     "LocalIntentClassifier",
     "ResponseDecision",
     "LocalResponder",
+    "PendingConversation",
     "ChatActionManager",
     "MEDIA_CHAT_ACTIONS",
 ]

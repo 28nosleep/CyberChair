@@ -103,10 +103,9 @@ class PersonaAndTrollModeTests(unittest.TestCase):
         self.assertEqual(request.max_output_tokens, 50)
         self.assertIn("не заканчивай ими сообщения автоматически", request.instructions)
 
-    def test_high_intensity_requires_real_meme_slang_layer(self):
+    def test_high_intensity_keeps_meme_slang_optional(self):
         request = self.build(conversation_decision=decision(.75)).request
-        self.assertIn("обязательно используй 1–2", request.instructions)
-        self.assertIn("сойджак", request.instructions)
+        self.assertIn("Сленг не обязателен", request.instructions)
 
     def test_troll_mode_off_uses_neutral_persona(self):
         result = self.build(troll_mode=False)

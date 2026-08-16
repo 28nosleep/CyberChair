@@ -26,7 +26,7 @@ class LocalIntentClassifier:
     """Deterministic direct-message classifier. It never calls a provider."""
 
     _substantive = re.compile(
-        r"(?:^|\s)(?:как|почему|зачем|сколько|ка(?:кой|кая|кие|кое)|кто\s+прав|"
+        r"(?:^|\s)(?:как|почему|зачем|сколько|ка(?:кой|кая|кие|кое)|кто|"
         r"что\s+(?:делать|думаешь|лучше|выбрать|купить|решили|случилось|происходит|нужно|будет)|посоветуй|подскажи|помоги|"
         r"объясни|расскажи|можно\s+ли|стоит\s+ли|куда|когда|где|откуда|"
         r"настрой|почини|сравни|выбери|разберись)(?:\s|$)",
@@ -52,6 +52,8 @@ class LocalIntentClassifier:
         normalized = normalize_spaces(text or "").casefold().strip(".,!?…:;—- ")
         if direct_reply and self._dependent_reply.search(normalized):
             return SUBSTANTIVE
+        if re.fullmatch(r"кто\s+тут\s+(?:соя|сойджак|лох|нпс)", normalized):
+            return SOCIAL
         if self._substantive.search(normalized):
             return SUBSTANTIVE
         if normalized in self._trivial or len(normalized.split()) <= 2 and not self._social.search(normalized):

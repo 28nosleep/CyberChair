@@ -1015,7 +1015,8 @@ def generate_command(message):
 def send_contextual_response(message, response):
     """Telegram-only sender for a provider-neutral text/media decision."""
     if not isinstance(response, MediaDecision):
-        bot.reply_to(message, response)
+        sent = bot.reply_to(message, response)
+        learning_service.attach_pending_bot_message(message, sent)
         return True
     if response.action == "gif":
         with chat_action_manager.activity(
@@ -1187,9 +1188,12 @@ def handle_message(message):
     direct_candidate = not is_who_command and (
         explicit_chair or replies_to_chair or mentions_chair or configured_address
     )
+    pending_candidate = not is_who_command and not direct_candidate and learning_service.is_pending_continuation(
+        message, bot_id=identity["id"]
+    )
     # A direct turn must not accidentally trigger a summary request and then a
     # second conversational request on the same incoming event.
-    if direct_candidate:
+    if direct_candidate or pending_candidate:
         learning_service.ingest(message, refresh_memory=False)
     else:
         learning_service.ingest(message)
@@ -1202,6 +1206,16 @@ def handle_message(message):
             and learning_service.activity_allows(message.chat.id)
         ):
             handle_who(message, text)
+        return
+
+    # A pending continuation belongs to the same mandatory-response lane as a
+    # direct address, but has higher dialogue priority and one final producer.
+    if pending_candidate:
+        generated = learning_service.maybe_pending_continuation(
+            message, bot_id=identity["id"]
+        )
+        if generated:
+            send_contextual_response(message, generated)
         return
 
     # Special commands above own their event. All remaining explicit chair

@@ -5,6 +5,13 @@ from .direct_address import SOCIAL, SUBSTANTIVE
 from .preprocessing import normalize_spaces
 
 
+PROFANITY_RE = re.compile(
+    r"\b(?:бля(?:ть|дь)?|ебать|ебан\w*|нахуй|пиздец|хуйн\w*|охуел\w*|"
+    r"заеб\w*|долбо[её]б\w*|проеб\w*|хуяр\w*|дохуя|нихуя|хули)\b",
+    re.I,
+)
+
+
 RESPONSES = {
     "summon": (
         "чё", "ну", "🪑", "chairOS на связи", "хули", "цель обнаружена",
@@ -22,6 +29,7 @@ RESPONSES = {
         "сам такой, биологический объект", "сильный аргумент, лил бро",
         "ругайся точнее, я записываю", "chairOS пережил и не такое",
         "цель обнаружена. интеллект пока нет", "ну поплачь об обивку",
+        "ебать, chairOS уничтожен словом из трёх букв", "иди нахуй точнее, я протоколирую",
     ),
     "confusion": (
         "в смысле", "раскрой эту шизотеорию", "чё конкретно", "говори словами",
@@ -31,6 +39,7 @@ RESPONSES = {
         "звучит как коуп", "сильный ларп, фактов пока ноль",
         "ну и кто тут сейчас нпс", "аргумент мид, подача гигачад",
         "chairOS фиксирует крашаут", "бро живёт у тебя рент фри",
+        "нихуя себе уверенность при нулевой доказательной базе",
     ),
     "dismissal": (
         "иди сам, у меня колёсики", "неубедительно", "отклонено по причине skill issue",
@@ -41,16 +50,19 @@ RESPONSES = {
         "chairOS ждёт конкретики", "принял, что дальше",
     ),
     "substantive_fallback": (
-        "давай детали: что именно происходит и что уже пробовал",
-        "накидай исходные данные и ограничения, разберём без гадания",
-        "уточни контекст и желаемый результат — иначе это ларп диагностики",
+        "между чем выбираешь, лил бро",
+        "какой главный параметр для тебя решающий?",
+        "какую точную модель рассматриваешь, лил бро?",
     ),
 }
 
 NEUTRAL_RESPONSES = {
     "trivial": ("слушаю", "да, я здесь", "говорите", "на связи"),
     "social": ("принято", "понял", "давайте по существу", "аргумент услышал"),
-    "substantive": RESPONSES["substantive_fallback"],
+    "substantive": (
+        "между чем выбираете?", "какой параметр для вас главный?",
+        "какую точную модель рассматриваете?",
+    ),
 }
 
 
@@ -79,11 +91,30 @@ class LocalResponder:
         return "acknowledgement"
 
     def respond(self, chat_id, text, intent, repository, excluded_meme_ids=(),
-                excluded_meme_groups=(), troll_mode=True):
+                excluded_meme_groups=(), troll_mode=True, troll_intensity=.6):
         category = self._category(text, intent)
+        normalized = normalize_spaces(text or "").casefold()
+        if intent == SUBSTANTIVE:
+            if re.search(r"\bкак\s+набрать\s+вес\b", normalized):
+                return ((
+                    "начни с профицита 250–350 ккал, белка 1.6–2 г/кг и силовых с прогрессией; "
+                    "две недели вес стоит — добавь ещё 150–200 ккал, без массонабора в пельмень"
+                    if troll_mode else
+                    "начните с профицита 250–350 ккал, белка 1.6–2 г/кг и силовых с прогрессией; "
+                    "если две недели вес стоит, добавьте ещё 150–200 ккал"
+                ), ())
+            if re.search(r"\bчто\s+выбрать\b", normalized) and len(normalized.split()) <= 4:
+                return (
+                    "между чем выбираешь, лил бро" if troll_mode else "между чем выбираете?",
+                    (),
+                )
         variants = list(
             RESPONSES[category] if troll_mode else NEUTRAL_RESPONSES[intent]
         )
+        if troll_mode and troll_intensity <= .4:
+            # Low intensity stays the same character but does not randomly jump
+            # to a high-intensity profanity variant.
+            variants = [item for item in variants if not PROFANITY_RE.search(item)] or variants
         since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         recent = [row["text"] for row in repository.generated_since(since)][-12:]
         fresh = [item for item in variants if item not in recent]
@@ -98,6 +129,7 @@ class LocalResponder:
             selected = self.lexicon.select(
                 text, {"humor", "mocking", "argument"}, .65,
                 excluded_meme_ids, excluded_meme_groups, limit=1,
+                recent_concepts=excluded_meme_groups,
             )
             if selected and selected[0].output not in result:
                 result = f"{result}, {selected[0].output}"

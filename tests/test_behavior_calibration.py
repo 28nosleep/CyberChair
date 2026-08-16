@@ -122,6 +122,64 @@ class BehaviorCalibrationTests(unittest.TestCase):
         self.assertNotIn("aura_loss", {entry.id for entry in second})
         self.assertNotIn("aura", {entry.id for entry in second})
 
+    def test_recent_concept_is_penalized_while_long_tail_stays_selectable(self):
+        lexicon = MemeLexicon()
+        fresh = lexicon.select(
+            "aura loss всё сломалось и упало", {"failure", "mocking"}, .8,
+            limit=3,
+        )
+        repeated = lexicon.select(
+            "aura loss всё сломалось и упало", {"failure", "mocking"}, .8,
+            limit=3, recent_concepts=("aura", "aura", "aura"),
+        )
+        self.assertIn("aura_loss", {entry.id for entry in fresh})
+        self.assertNotIn("aura_loss", {entry.id for entry in repeated})
+        self.assertTrue(repeated)
+
+    def test_rolling_diversity_avoids_new_default_meme_ticks(self):
+        lexicon = MemeLexicon()
+        recent = []
+        selected = []
+        for index in range(40):
+            entry = lexicon.select(
+                f"всё сломалось и упало с ошибкой {index}",
+                {"failure", "mocking"}, .8, limit=1,
+                recent_concepts=recent,
+            )[0]
+            selected.append(entry)
+            recent = (recent + [entry.cooldown_group])[-16:]
+        counts = {identifier: sum(item.id == identifier for item in selected)
+                  for identifier in ("aura_loss", "lil_bro", "crashout", "larp")}
+        self.assertTrue(all(count <= 3 for count in counts.values()))
+        self.assertGreaterEqual(len({item.cooldown_group for item in selected}), 12)
+        self.assertEqual(
+            lexicon.select("как сварить рис", {"casual"}, .8, limit=1), []
+        )
+
+    def test_position_first_instruction_covers_concrete_choice_phrasings(self):
+        builder = PersonaBuilder(self.settings(), MemeLexicon())
+        for question in (
+            "стул кто самый перспективный русский рэпер",
+            "стул какой лучше айфон или пиксель",
+            "стул что купить из x y z",
+            "стул кого бы ты выбрал",
+            "стул кто тут прав",
+        ):
+            with self.subTest(question=question):
+                built = builder.build_request(
+                    -1, question, "question", conversation_decision=decision(),
+                    chat_state=state("casual", None), troll_mode=True,
+                )
+                self.assertIn("POSITION FIRST", built.request.input)
+                self.assertIn("В первом предложении обязательно назови", built.request.input)
+
+    def test_ambiguous_two_word_choice_does_not_force_invented_position(self):
+        built = PersonaBuilder(self.settings(), MemeLexicon()).build_request(
+            -1, "стул кто лучше", "question", conversation_decision=decision(),
+            chat_state=state("casual", None), troll_mode=True,
+        )
+        self.assertNotIn("POSITION FIRST", built.request.input)
+
     def test_bare_chair_has_separate_lower_probability(self):
         service = LearningService(self.settings(), rng=FixedRandom(.32))
         with (

@@ -46,10 +46,12 @@ class MemeLexicon:
     def recognize(self, text):
         return [entry for entry in self.entries if entry.recognizes(text)]
 
-    def select(self, text, contexts, intensity, excluded_ids=(), excluded_groups=(), limit=3):
+    def select(self, text, contexts, intensity, excluded_ids=(), excluded_groups=(),
+               limit=3, recent_concepts=()):
         contexts = set(contexts or ())
         recognized = {entry.id for entry in self.recognize(text)}
         excluded_ids, excluded_groups = set(excluded_ids), set(excluded_groups)
+        recent_concepts = tuple(recent_concepts or ())
         signal_contexts = set(contexts)
         normalized = _normalized(text)
         signals = {
@@ -77,7 +79,18 @@ class MemeLexicon:
                 hashlib.sha256(f"{normalized}:{entry.id}".encode("utf-8")).digest()[:4],
                 "big",
             ) / 2**32
-            scored.append((10 if explicit else 0, overlap, entry.weight, diversity, entry))
+            # A concept group is the cooldown identity, so aliases such as
+            # "аура" / "минус аура" cannot dodge it. Recent concepts are not
+            # permanently forbidden here: relevance still wins when it is truly
+            # decisive, while a long-tail relevant concept gets a real chance.
+            recency = 0.0
+            for distance, concept in enumerate(reversed(recent_concepts), start=1):
+                if concept == entry.cooldown_group:
+                    recency += 35.0 / distance
+            repeats = sum(concept == entry.cooldown_group for concept in recent_concepts)
+            novelty = min(1.25, len(recent_concepts) / 16) if not repeats else 0.0
+            score = (100 if explicit else 0) + overlap * 10 + entry.weight + novelty - recency - repeats * 20
+            scored.append((score, diversity, entry))
         scored.sort(reverse=True)
         return [item[-1] for item in scored[: max(0, int(limit))]]
 

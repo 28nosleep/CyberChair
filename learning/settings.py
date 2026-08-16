@@ -87,6 +87,9 @@ class LearningSettings:
     complex_context_message_limit: int = field(default_factory=lambda: _int("COMPLEX_CONTEXT_MESSAGE_LIMIT", 20))
     autonomous_context_message_limit: int = field(default_factory=lambda: _int("AUTONOMOUS_CONTEXT_MESSAGE_LIMIT", 8))
     short_memory_minutes: int = field(default_factory=lambda: _int("SHORT_MEMORY_MINUTES", 30))
+    pending_conversation_ttl_seconds: int = field(
+        default_factory=lambda: _int("PENDING_CONVERSATION_TTL_SECONDS", 1200)
+    )
     summary_message_interval: int = field(default_factory=lambda: _int("SUMMARY_MESSAGE_INTERVAL", 50))
     summary_time_interval: int = field(default_factory=lambda: _int("SUMMARY_TIME_INTERVAL", 1200))
     max_long_memories: int = field(default_factory=lambda: _int("MAX_LONG_MEMORIES", 40))
