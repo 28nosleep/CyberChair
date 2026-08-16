@@ -30,6 +30,9 @@ from .pending_conversation import (
     extract_clarification,
     looks_like_continuation,
     pending_mode,
+    is_ambiguous_choice_request,
+    choice_declined,
+    extract_choice_alternatives,
 )
 from .preprocessing import (
     FOREIGN_BOT_COMMAND_RE,
@@ -623,6 +626,13 @@ class LearningService:
         user_id = getattr(getattr(message, "from_user", None), "id", None)
         if clarification is None or user_id is None:
             return False
+        expected_type = expected_answer_type(clarification)
+        # A model may ask a generic choice question after any answer. It must
+        # never turn a how-to/factual turn into a hard choice dialogue.
+        if expected_type == "choices" and not is_ambiguous_choice_request(
+            getattr(message, "text", "") or ""
+        ):
+            return False
         self.repository(message.chat.id).save_pending_conversation(
             user_id=user_id,
             original_message_id=getattr(message, "message_id", getattr(message, "id", None)),
@@ -630,7 +640,7 @@ class LearningService:
             clarification_question=clarification,
             intent=intent,
             context=normalize_spaces(response),
-            expected_type=expected_answer_type(clarification),
+            expected_type=expected_type,
             pending_mode=pending_mode(response, clarification),
         )
         return True
@@ -701,7 +711,10 @@ class LearningService:
         if pending.expected_type == "budget":
             return f"с бюджетом {normalize_spaces(answer)} уже можно резать варианты по реальной цене; бери лучший по главному сценарию, а не по маркетинговым мегапикселям"
         if pending.expected_type == "choices":
-            return f"из этих вариантов сначала сравни главный сценарий, цену и что бесит ежедневно; без этого выбор будет чистым глейзингом бренда"
+            alternatives = extract_choice_alternatives(answer)
+            if len(alternatives) >= 2:
+                return f"между {alternatives[0]} и {alternatives[1]} сначала сравни главный сценарий, цену и что бесит ежедневно; без этого выбор будет чистым глейзингом бренда"
+            return "варианты не извлеклись — не буду придумывать выбор из воздуха"
         return f"принял: {normalize_spaces(answer)}. теперь по исходной теме уже можно отвечать без гадания; chairOS контекст не проебал"
 
     def maybe_pending_continuation(self, message, bot_id=None, current=None):
@@ -711,6 +724,11 @@ class LearningService:
             return None
         user_id = getattr(getattr(message, "from_user", None), "id", None)
         pending = self.pending_conversation(chat_id, user_id, current) if user_id is not None else None
+        if pending and pending.expected_type == "choices" and choice_declined(
+            getattr(message, "text", "") or ""
+        ):
+            self.repository(chat_id).clear_pending_conversation(user_id)
+            return None
         if pending is None or not self.is_pending_continuation(message, bot_id, current):
             return None
         repository = self.repository(chat_id)

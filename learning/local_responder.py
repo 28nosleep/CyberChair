@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from .direct_address import SOCIAL, SUBSTANTIVE
 from .preprocessing import normalize_spaces
+from .pending_conversation import is_ambiguous_choice_request
 
 
 PROFANITY_RE = re.compile(
@@ -50,9 +51,9 @@ RESPONSES = {
         "chairOS ждёт конкретики", "принял, что дальше",
     ),
     "substantive_fallback": (
-        "между чем выбираешь, лил бро",
-        "какой главный параметр для тебя решающий?",
-        "какую точную модель рассматриваешь, лил бро?",
+        "вопрос по делу, но без модели лучше не галлюцинировать ответ из обивки",
+        "дай предмет и цель — chairOS разложит без фанфика",
+        "нужен конкретный контекст, иначе будет ответ уровня гадания на колёсиках",
     ),
 }
 
@@ -60,8 +61,7 @@ NEUTRAL_RESPONSES = {
     "trivial": ("слушаю", "да, я здесь", "говорите", "на связи"),
     "social": ("принято", "понял", "давайте по существу", "аргумент услышал"),
     "substantive": (
-        "между чем выбираете?", "какой параметр для вас главный?",
-        "какую точную модель рассматриваете?",
+        "уточните предмет и цель, чтобы ответ был полезным",
     ),
 }
 
@@ -103,7 +103,7 @@ class LocalResponder:
                     "начните с профицита 250–350 ккал, белка 1.6–2 г/кг и силовых с прогрессией; "
                     "если две недели вес стоит, добавьте ещё 150–200 ккал"
                 ), ())
-            if re.search(r"\bчто\s+выбрать\b", normalized) and len(normalized.split()) <= 4:
+            if is_ambiguous_choice_request(normalized):
                 return (
                     "между чем выбираешь, лил бро" if troll_mode else "между чем выбираете?",
                     (),

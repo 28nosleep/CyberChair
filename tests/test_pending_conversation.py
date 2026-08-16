@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from learning import LearningService, LearningSettings
+from learning.pending_conversation import question_intent
 
 
 class CountingProvider:
@@ -94,6 +95,45 @@ class PendingConversationTests(unittest.TestCase):
         self.assertEqual(pending.mode, "hard")
         self.assertEqual(len(provider.calls), 1)
 
+    def test_how_to_wins_over_model_choice_clarification(self):
+        service, provider = self.service(["между чем выбираешь, лил бро?"])
+        result = service.maybe_direct_reply(
+            message("так и как по итогу прославиться в рэпе, стул?"),
+            explicit_address=True,
+        )
+        self.assertIn("между чем", result)
+        self.assertEqual(question_intent("так и как по итогу прославиться в рэпе"), "how_to")
+        self.assertEqual(service._last_direct_decision[-1].intent, "substantive")
+        self.assertIsNone(service.pending_conversation(-1, 7))
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_original_dialogue_no_longer_has_choice_continuation(self):
+        service, provider = self.service([
+            "сначала сделай узнаваемый звук, регулярно выпускай сниппеты и треки, ищи коллабы своего размера и играй лайвы",
+        ])
+        first = service.maybe_direct_reply(
+            message("так и как по итогу прославиться в рэпе, стул?"),
+            explicit_address=True,
+        )
+        self.assertIn("узнаваемый звук", first)
+        self.assertIsNone(service.pending_conversation(-1, 7))
+        self.assertIsNone(service.maybe_pending_continuation(message("между ничем", 2), bot_id=99))
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_how_to_choice_wording_never_creates_choices_pending(self):
+        for text in ("стул как набрать вес?", "стул как выбрать микрофон?"):
+            with self.subTest(text=text):
+                service, _ = self.service(["между чем выбираешь?"])
+                service.maybe_direct_reply(message(text), explicit_address=True)
+                self.assertIsNone(service.pending_conversation(-1, 7))
+
+    def test_concrete_choice_does_not_create_hard_choice_pending(self):
+        for text in ("стул айфон или пиксель?", "стул что лучше X или Y?"):
+            with self.subTest(text=text):
+                service, _ = self.service(["между чем выбираешь?"])
+                service.maybe_direct_reply(message(text), explicit_address=True)
+                self.assertIsNone(service.pending_conversation(-1, 7))
+
     def test_choice_continuation_without_reply_is_required_and_one_call(self):
         service, provider = self.service([
             "между чем выбираешь, лил бро?",
@@ -106,6 +146,64 @@ class PendingConversationTests(unittest.TestCase):
         self.assertIsNone(service.pending_conversation(-1, 7))
         self.assertIn("Исходный вопрос пользователя", provider.calls[-1].input)
         self.assertIn("айфон и пиксель", provider.calls[-1].input)
+
+    def test_choice_decline_closes_pending_without_phantom_continuation(self):
+        service, provider = self.service(["между чем выбираешь?"])
+        service.maybe_direct_reply(message("стул что выбрать"), explicit_address=True)
+        self.assertFalse(service.is_pending_continuation(message("между ничем", 2), bot_id=99))
+        self.assertIsNone(service.maybe_pending_continuation(message("между ничем", 2), bot_id=99))
+        self.assertIsNone(service.pending_conversation(-1, 7))
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_local_choice_fallback_never_claims_unparsed_options(self):
+        service, _ = self.service()
+        pending = service.pending_conversation(-1, 7)
+        self.assertIsNone(pending)
+        from learning.pending_conversation import PendingConversation
+        fake = PendingConversation(-1, 7, None, 1, "что выбрать", "между чем?", "substantive", "", "choices", "hard", datetime.now(timezone.utc))
+        self.assertNotIn("из этих вариантов", service._local_continuation_fallback(fake, "первый"))
+
+    def test_thirty_direct_question_intent_matrix(self):
+        cases = (
+            # how-to
+            ("как прославиться в рэпе", "how_to"),
+            ("как приготовить курицу", "how_to"),
+            ("как поднять сервер", "how_to"),
+            ("как познакомиться с девушкой", "how_to"),
+            ("как набрать вес", "how_to"),
+            ("как начать программировать", "how_to"),
+            ("как починить docker", "how_to"),
+            ("как найти работу", "how_to"),
+            ("как мне заработать", "how_to"),
+            ("так и как по итогу стать артистом", "how_to"),
+            # factual / explanation
+            ("почему docker падает", "factual"),
+            ("что такое dns", "factual"),
+            ("кто придумал биткоин", "factual"),
+            ("где лежат логи nginx", "factual"),
+            ("когда выйдет релиз", "factual"),
+            ("сколько белка нужно", "factual"),
+            ("зачем нужен redis", "factual"),
+            # choice
+            ("что выбрать", "choice"),
+            ("какой выбрать", "choice"),
+            ("айфон или пиксель", "choice"),
+            ("что лучше X или Y", "choice"),
+            ("какой из этих взять", "choice"),
+            ("выбрать X или Y", "choice"),
+            # open advice / opinion
+            ("посоветуй микрофон", "open_advice"),
+            ("что думаешь про новый альбом", "open_advice"),
+            ("стоит ли брать подписку", "open_advice"),
+            ("помоги с резюме", "open_advice"),
+            ("какой ноутбук для работы", "open_advice"),
+            ("как выбрать микрофон", "how_to"),
+            ("что купить для записи", "open_advice"),
+        )
+        self.assertEqual(len(cases), 30)
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(question_intent(text), expected)
 
     def test_measurements_continue_original_weight_topic(self):
         service, provider = self.service([

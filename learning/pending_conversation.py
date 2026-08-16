@@ -33,6 +33,64 @@ _QUESTION_REQUEST_RE = re.compile(
     re.I,
 )
 
+# These labels deliberately stay local to the pending/clarification boundary.
+# Routing still uses the compact trivial/social/substantive classifier.
+HOW_TO = "how_to"
+CHOICE = "choice"
+FACTUAL = "factual"
+OPEN_ADVICE = "open_advice"
+
+_HOW_TO_RE = re.compile(
+    r"(?:^|\b)как\s+(?:(?:мне|по\s+итогу)\s+)?"
+    r"(?:сделать|добиться|стать|начать|научиться|прославиться|заработать|"
+    r"попасть|получить|приготовить|поднять|познакомиться|набрать|починить|"
+    r"найти|выбрать|[а-яёa-z][а-яёa-z-]*)\b",
+    re.I,
+)
+_AMBIGUOUS_CHOICE_RE = re.compile(r"(?:^|\b)(?:что\s+выбрать|какой\s+выбрать)(?:\?|$)", re.I)
+_CHOICE_CUE_RE = re.compile(
+    r"(?:\b(?:или|vs|либо)\b|что\s+лучше|какой\s+из\s+(?:этих|них)\s+(?:взять|выбрать)|выбрать\s+.+\s+(?:или|vs|либо)\s+.+)",
+    re.I,
+)
+_CHOICE_DECLINE_RE = re.compile(
+    r"^(?:между\s+ничем|ни\s+между\s+чем|хз|не\s+знаю|забей|неважно)[.!?… ]*$",
+    re.I,
+)
+
+
+def question_intent(text):
+    """Classify only enough to prevent clarification from inventing a choice."""
+    value = normalize_spaces(text or "").casefold().strip(" .,!?…:;—-")
+    # "как + verb" is stronger negative evidence than every choice cue.
+    if _HOW_TO_RE.search(value):
+        return HOW_TO
+    if _AMBIGUOUS_CHOICE_RE.search(value):
+        return CHOICE
+    if _CHOICE_CUE_RE.search(value):
+        return CHOICE
+    if re.search(r"(?:^|\b)(?:почему|зачем|кто|где|когда|сколько|что\s+такое)\b", value):
+        return FACTUAL
+    return OPEN_ADVICE
+
+
+def is_ambiguous_choice_request(text):
+    value = normalize_spaces(text or "").casefold().strip(" .,!?…:;—-")
+    return question_intent(value) == CHOICE and bool(_AMBIGUOUS_CHOICE_RE.search(value))
+
+
+def choice_declined(text):
+    return bool(_CHOICE_DECLINE_RE.fullmatch(normalize_spaces(text or "")))
+
+
+def extract_choice_alternatives(text):
+    """Return alternatives only for an actual two-or-more-item choice fragment."""
+    value = normalize_spaces(text or "").strip(" .,!?:;—-")
+    if choice_declined(value):
+        return ()
+    parts = re.split(r"\s+(?:или|vs|либо|и)\s+", value, flags=re.I)
+    parts = [part.strip(" .,!?:;—-") for part in parts if part.strip(" .,!?:;—-")]
+    return tuple(parts) if len(parts) >= 2 else ()
+
 
 def expected_answer_type(question):
     value = normalize_spaces(question or "").casefold()
@@ -86,9 +144,7 @@ def looks_like_continuation(text, expected_type, mode="hard"):
             re.search(r"\d|тысяч|к|руб|без\s+лимита", value)
         )
     if expected_type == "choices":
-        return len(value.split()) <= 16 and bool(
-            re.search(r"\b(?:и|или|vs|либо|между)\b", value)
-        )
+        return len(value.split()) <= 16 and bool(extract_choice_alternatives(value))
     if expected_type == "platform":
         return bool(re.search(r"\b(?:windows|винд|mac|мак|linux|линукс|ios|android)\b", value))
     # A fresh explicit question is a new turn, not an accidental answer to an
