@@ -81,8 +81,10 @@ class ConversationPolicy:
                 "quiet_hours", 0.0, 0.0,
             )
         if addressed:
-            probability = self.settings.reply_to_stul_chance if llm_allowed else 0.0
-            action = "reply" if probability > 0 else "none"
+            # Direct-address routing chooses the producer separately. Policy is
+            # no longer allowed to turn an explicit address into IGNORE.
+            probability = 1.0
+            action = "reply"
             return ConversationDecision(
                 action=action,
                 reply_probability=round(probability, 4),
@@ -92,8 +94,8 @@ class ConversationPolicy:
                 target_message_id=state.target_message_id,
                 target_user_id=state.target_user_id,
                 reason="+".join(reason_parts + (["addressed"] if addressed else [])),
-                local_probability=0.0,
-                llm_probability=round(probability, 4),
+                local_probability=1.0 if local_allowed or not llm_allowed else 0.0,
+                llm_probability=1.0 if llm_allowed else 0.0,
             )
         local_chance = self.settings.random_reply_chance * activity_factor * type_factor
         conditional_llm_chance = (

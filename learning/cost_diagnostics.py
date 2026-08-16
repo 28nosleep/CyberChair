@@ -38,6 +38,28 @@ def format_report(report):
     return "\n".join(lines)
 
 
+def format_direct_report(events, usage_report):
+    received = events.get("direct_addresses", 0) + events.get("direct_replies", 0)
+    routes = {
+        name: events.get(f"route_{name}", 0)
+        for name in ("local", "grok", "gif", "sticker", "markov", "meme")
+    }
+    answered = sum(routes.values())
+    rate = 100.0 if not received else min(100.0, answered * 100 / received)
+    share = 0.0 if not answered else routes["grok"] * 100 / answered
+    cost = usage_report["total"]["cost_usd_ticks"]
+    return "\n".join((
+        "DIRECT RESPONSES / 24h",
+        f"received: {received}",
+        f"answered: {answered}",
+        f"response rate: {rate:.1f}%",
+        " | ".join(f"{name}: {count}" for name, count in routes.items()),
+        f"Grok share: {share:.1f}%",
+        f"actual cost: {_cost(cost)}",
+        f"grok fallback local: {events.get('grok_fallback_local', 0)}",
+    ))
+
+
 def main():
     parser = argparse.ArgumentParser(description="CyberChair local LLM cost diagnostics")
     parser.add_argument("--chat-id", type=int, required=True)
@@ -46,7 +68,10 @@ def main():
     args = parser.parse_args()
     since = (datetime.now(timezone.utc) - timedelta(hours=args.hours)).isoformat()
     repository = ChatRepository(args.data_dir, args.chat_id)
-    print(format_report(repository.llm_usage_report(since)))
+    usage = repository.llm_usage_report(since)
+    print(format_report(usage))
+    print()
+    print(format_direct_report(repository.routing_report(since), usage))
 
 
 if __name__ == "__main__":

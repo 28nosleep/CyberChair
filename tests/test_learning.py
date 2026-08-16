@@ -299,12 +299,14 @@ class LearningTests(unittest.TestCase):
         with (
             patch.object(bot_module.learning_service, "maybe_command_meme", return_value=object()),
             patch.object(bot_module, "send_manual_meme", return_value=True) as send,
+            patch.object(bot_module.learning_service, "maybe_direct_reply") as direct,
             patch.object(bot_module.bot, "reply_to") as reply,
             patch.object(bot_module, "remember_user") as remember,
         ):
             bot_module.handle_message(incoming)
         send.assert_called_once()
         reply.assert_not_called()
+        direct.assert_not_called()
         remember.assert_not_called()
 
     def test_ten_contextual_chair_calls_answer_their_topics(self):
@@ -423,7 +425,15 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(len(set(minutes)), 2)
         self.assertTrue(all(11 * 60 <= item < 25 * 60 for item in minutes))
         self.assertEqual(minutes, daily_quote_minutes(datetime(2026, 8, 6, 0, 30)))
-        self.assertEqual(len(MOVIE_QUOTES), 42)
+        self.assertEqual(len(MOVIE_QUOTES), 61)
+        self.assertEqual(
+            len([quote for quote in MOVIE_QUOTES if quote[2] == "Мистер Робот"]),
+            8,
+        )
+        self.assertIn(
+            "Разговоры дешевы. Покажите мне код",
+            {quote[0] for quote in MOVIE_QUOTES},
+        )
         self.assertEqual(
             format_movie_quote(MOVIE_QUOTES[0]),
             "<i>«Будущее не предопределено. Нет судьбы, кроме той, что мы творим сами»\n\n"
@@ -500,7 +510,7 @@ class LearningTests(unittest.TestCase):
             self.assertTrue(is_stul_message(text))
         self.assertFalse(is_stul_message("обычное сообщение"))
 
-    def test_plain_stul_never_replies_with_timer_statistics(self):
+    def test_plain_stul_uses_guaranteed_direct_router(self):
         import bot as bot_module
 
         incoming = message(-1, 99, "стул")
@@ -508,16 +518,19 @@ class LearningTests(unittest.TestCase):
             patch.object(bot_module, "remember_user"),
             patch.object(bot_module.learning_service, "ingest"),
             patch.object(bot_module.learning_service, "activity_allows", return_value=True),
+            patch.object(bot_module, "get_bot_identity", return_value={"id": 99, "username": "chair"}),
             patch.object(
                 bot_module.learning_service,
-                "maybe_stul_cooldown_reply",
-                return_value=None,
+                "maybe_direct_reply",
+                return_value="да тут я",
             ) as generated,
-            patch.object(bot_module.bot, "reply_to") as reply_to,
+            patch.object(bot_module, "send_contextual_response") as send,
         ):
             bot_module.handle_message(incoming)
-        generated.assert_called_once_with(incoming)
-        reply_to.assert_not_called()
+        generated.assert_called_once_with(
+            incoming, bot_id=99, bot_username="chair", explicit_address=True,
+        )
+        send.assert_called_once_with(incoming, "да тут я")
 
     def test_chair_remaining_time_is_available_only_by_exact_command(self):
         import bot as bot_module
@@ -534,31 +547,26 @@ class LearningTests(unittest.TestCase):
         remember_user.assert_not_called()
         ingest.assert_not_called()
 
-    def test_plain_stul_announces_active_cooldown(self):
+    def test_plain_stul_bypasses_old_cooldown(self):
         import bot as bot_module
 
         incoming = message(-1, 100, "стул")
         with (
             patch.object(bot_module, "remember_user"),
             patch.object(bot_module.learning_service, "ingest"),
-            patch.object(
-                bot_module.learning_service,
-                "take_stul_cooldown_notice",
-                side_effect=[125, 0],
-            ),
             patch.object(bot_module.learning_service, "activity_allows", return_value=True),
+            patch.object(bot_module, "get_bot_identity", return_value={"id": 99, "username": "chair"}),
             patch.object(
                 bot_module.learning_service,
-                "maybe_stul_cooldown_reply",
-                return_value=None,
+                "maybe_direct_reply",
+                side_effect=["чё", "ну"],
             ) as generated,
-            patch.object(bot_module.bot, "reply_to") as reply_to,
+            patch.object(bot_module, "send_contextual_response") as send,
         ):
             bot_module.handle_message(incoming)
             bot_module.handle_message(incoming)
-        generated.assert_called_once_with(incoming)
-        reply_to.assert_called_once()
-        self.assertIn("2 мин 5 сек", reply_to.call_args.args[1])
+        self.assertEqual(generated.call_count, 2)
+        self.assertEqual(send.call_count, 2)
 
     def test_k_who_prunes_members_who_left_the_chat(self):
         import bot as bot_module

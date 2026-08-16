@@ -175,6 +175,13 @@ class ChatRepository:
                     ON llm_calls(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_llm_calls_type_created
                     ON llm_calls(call_type, created_at DESC);
+                CREATE TABLE IF NOT EXISTS routing_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_routing_events_created
+                    ON routing_events(created_at DESC);
             """)
             llm_call_columns = {
                 row[1] for row in db.execute("PRAGMA table_info(llm_calls)")
@@ -502,6 +509,28 @@ class ChatRepository:
         totals["active_chats"] = 1 if totals["calls"] else 0
         totals["avg_cost_per_chat_day_usd_ticks"] = totals["cost_usd_ticks"]
         return {"groups": groups, "total": totals}
+
+    def record_routing_event(self, event_type, created_at=None):
+        """Store routing counters only; message text is deliberately excluded."""
+        stamp = (created_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                "INSERT INTO routing_events(event_type, created_at) VALUES (?, ?)",
+                (str(event_type), stamp),
+            )
+            db.execute(
+                "DELETE FROM routing_events WHERE created_at < ?",
+                ((datetime.now(timezone.utc) - timedelta(days=31)).isoformat(),),
+            )
+
+    def routing_report(self, since_iso):
+        with self._lock, closing(self._connect()) as db:
+            rows = db.execute(
+                "SELECT event_type, COUNT(*) AS count FROM routing_events "
+                "WHERE created_at >= ? GROUP BY event_type",
+                (since_iso,),
+            ).fetchall()
+        return {row["event_type"]: int(row["count"]) for row in rows}
 
     def generated_since(self, since_iso, kind=None):
         query = "SELECT text, kind, created_at FROM generated WHERE created_at >= ?"
@@ -929,6 +958,7 @@ class ChatRepository:
             db.execute("DELETE FROM scheduled_events")
             db.execute("DELETE FROM media_metadata")
             db.execute("DELETE FROM media_usage")
+            db.execute("DELETE FROM routing_events")
             db.execute(
                 "INSERT OR REPLACE INTO summary_state(singleton, last_message_row_id, "
                 "last_summary_at, pending_since) VALUES(1, 0, NULL, NULL)"

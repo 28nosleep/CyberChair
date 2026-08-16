@@ -1077,11 +1077,33 @@ def handle_message(message):
             bot.reply_to(message, story)
         return
 
-    learning_service.ingest(message)
+    is_who_command = bool(WHO_COMMAND_RE.fullmatch(text))
+    identity = get_bot_identity()
+    reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+    replies_to_chair = bool(
+        reply_user and identity["id"] and reply_user.id == identity["id"]
+    )
+    mentions_chair = bool(
+        identity["username"]
+        and f"@{identity['username']}".casefold() in text.casefold()
+    )
+    configured_address = any(
+        phrase in text.casefold() for phrase in learning_settings.special_phrases
+    )
+    explicit_chair = is_stul_message(text)
+    direct_candidate = not is_who_command and (
+        explicit_chair or replies_to_chair or mentions_chair or configured_address
+    )
+    # A direct turn must not accidentally trigger a summary request and then a
+    # second conversational request on the same incoming event.
+    if direct_candidate:
+        learning_service.ingest(message, refresh_memory=False)
+    else:
+        learning_service.ingest(message)
 
     # The complete "к кто ..." command has priority over words inside its
     # argument, including "стул" and "стульчик".
-    if WHO_COMMAND_RE.fullmatch(text):
+    if is_who_command:
         if (
             learning_service.troll_mode(message.chat.id)
             and learning_service.activity_allows(message.chat.id)
@@ -1089,72 +1111,48 @@ def handle_message(message):
             handle_who(message, text)
         return
 
-    if (
-        learning_service.troll_mode(message.chat.id)
-        and is_stul_message(text)
-        and "?" not in text
-    ):
-        remaining = learning_service.take_stul_cooldown_notice(message.chat.id)
-        if remaining > 0:
-            minutes, seconds = divmod(remaining, 60)
-            bot.reply_to(
-                message,
-                "🪑 Киберстул на кулдауне "
-                f"осталось {minutes} мин {seconds} сек",
-            )
-            return
-
-    if not learning_service.activity_allows(message.chat.id):
-        return
-
-    # With the troll layer disabled, an explicit chair address is a compact
-    # work-context request even when Telegram prose omits a question mark.
-    if not learning_service.troll_mode(message.chat.id) and is_stul_message(text):
-        generated = learning_service.maybe_question_reply(message)
-        if generated:
-            send_contextual_response(message, generated)
-        return
-
-    # A direct question is a conversation trigger, not a request for the work
-    # timer. It has its own one-minute per-chat cooldown.
-    if is_stul_message(text) and "?" in text:
-        generated = learning_service.maybe_question_reply(message)
-        if generated:
-            bot.reply_to(message, generated)
-        return
-
-    if not is_stul_message(text):
-        if is_creator_message(message):
-            generated = learning_service.maybe_special_ai(
-                message,
-                # Share the ordinary random-reply bucket and probability, so
-                # the creator never receives more unsolicited reactions than
-                # other chat members.
-                "random",
-                learning_settings.random_reply_chance,
-                "creator",
-                addressed=False,
-            )
-            if generated:
-                bot.reply_to(message, generated)
-            return
-
-        if learning_service.troll_mode(message.chat.id) and reaction_text(message):
-            return
-
-        identity = get_bot_identity()
-        generated = learning_service.maybe_reply(
+    # Special commands above own their event. All remaining explicit chair
+    # addresses and replies enter one mandatory-response arbitration path
+    # before activity sampling/cooldowns can discard them.
+    if direct_candidate:
+        generated = learning_service.maybe_direct_reply(
             message,
             bot_id=identity["id"],
             bot_username=identity["username"],
+            explicit_address=explicit_chair,
         )
         if generated:
             send_contextual_response(message, generated)
         return
 
-    generated = learning_service.maybe_stul_cooldown_reply(message)
+    if not learning_service.activity_allows(message.chat.id):
+        return
+
+    if is_creator_message(message):
+        generated = learning_service.maybe_special_ai(
+            message,
+            # Share the ordinary random-reply bucket and probability, so
+            # the creator never receives more unsolicited reactions than
+            # other chat members.
+            "random",
+            learning_settings.random_reply_chance,
+            "creator",
+            addressed=False,
+        )
+        if generated:
+            bot.reply_to(message, generated)
+        return
+
+    if learning_service.troll_mode(message.chat.id) and reaction_text(message):
+        return
+
+    generated = learning_service.maybe_reply(
+        message,
+        bot_id=identity["id"],
+        bot_username=identity["username"],
+    )
     if generated:
-        bot.reply_to(message, generated)
+        send_contextual_response(message, generated)
 
 # ==========================================
 # ЗАПУСК БОТА

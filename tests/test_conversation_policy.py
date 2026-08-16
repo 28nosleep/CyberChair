@@ -320,9 +320,9 @@ class ConversationPolicyTests(unittest.TestCase):
         provider = LocalProvider()
         service, _ = self.service(provider, rng=ZeroRandom())
         repository = service.repository(-1)
-        self.add(repository, 1, 1, "ахаха прямой ответ боту", 0)
+        self.add(repository, 1, 1, "почему контейнер падает", 0)
         bot_reply = SimpleNamespace(from_user=SimpleNamespace(id=99), message_id=900)
-        message = incoming(1, "ахаха прямой ответ боту", reply=bot_reply)
+        message = incoming(1, "почему контейнер падает", reply=bot_reply)
         self.assertIsNotNone(service.maybe_reply(message, bot_id=99))
         metadata = provider.generate_calls[0].metadata
         self.assertIn("troll_intensity", metadata["conversation_decision"])

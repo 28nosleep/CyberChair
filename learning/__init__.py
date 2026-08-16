@@ -15,6 +15,8 @@ from .persona import PersonaBuilder
 from .provider_factory import create_llm_provider
 from .service import LearningService
 from .settings import LearningSettings
+from .direct_address import DirectAddressRouter, LocalIntentClassifier, ResponseDecision
+from .local_responder import LocalResponder
 
 __all__ = [
     "GenerateRequest",
@@ -41,4 +43,8 @@ __all__ = [
     "RenderResult",
     "SummarizeRequest",
     "create_llm_provider",
+    "DirectAddressRouter",
+    "LocalIntentClassifier",
+    "ResponseDecision",
+    "LocalResponder",
 ]

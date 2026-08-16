@@ -137,11 +137,14 @@ class PersonaAndTrollModeTests(unittest.TestCase):
             patch.object(bot_module.learning_service, "ingest"),
             patch.object(bot_module.learning_service, "troll_mode", return_value=False),
             patch.object(bot_module.learning_service, "activity_allows", return_value=True),
-            patch.object(bot_module.learning_service, "maybe_question_reply", return_value="релиз в пятницу") as useful,
-            patch.object(bot_module.bot, "reply_to") as reply,
+            patch.object(bot_module, "get_bot_identity", return_value={"id": 99, "username": "chair"}),
+            patch.object(bot_module.learning_service, "maybe_direct_reply", return_value="релиз в пятницу") as useful,
+            patch.object(bot_module, "send_contextual_response") as reply,
         ):
             bot_module.handle_message(incoming)
-        useful.assert_called_once_with(incoming)
+        useful.assert_called_once_with(
+            incoming, bot_id=99, bot_username="chair", explicit_address=True,
+        )
         reply.assert_called_once_with(incoming, "релиз в пятницу")
 
     def test_low_and_high_intensity_have_different_instructions(self):

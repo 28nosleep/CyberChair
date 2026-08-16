@@ -10,6 +10,9 @@ from datetime import datetime, timedelta, timezone
 from .filters import similarity, validate_generated
 from .chat_state import ChatStateAnalyzer
 from .conversation_policy import ConversationPolicy
+from .direct_address import DirectAddressRouter, SOCIAL, SUBSTANTIVE
+from .local_responder import LocalResponder
+from .cost_diagnostics import TICKS_PER_USD
 from .autonomous_policy import AutonomousPolicy
 from .generator import LocalGenerator
 from .markov import MarkovModel
@@ -92,6 +95,8 @@ class LearningService:
         self.autonomous_policy = AutonomousPolicy(settings, self.conversation_policy)
         self.meme_lexicon = MemeLexicon()
         self.persona = PersonaBuilder(settings, self.meme_lexicon)
+        self.direct_router = DirectAddressRouter()
+        self.local_responder = LocalResponder(self.meme_lexicon, self.rng)
         self.media_catalog = MediaCatalog()
         self.media = MediaService(settings, self.media_catalog, self.rng)
         self.meme_renderer = MemeRenderer(
@@ -104,6 +109,7 @@ class LearningService:
         self._last_chat_state = {}
         self._last_conversation_decision = {}
         self._last_autonomous_decision = {}
+        self._last_direct_decision = {}
         self._repositories = {}
         self._models = OrderedDict()
         self._model_counts = {}
@@ -208,7 +214,7 @@ class LearningService:
         self.repository(chat_id).set_setting("llm_provider", name)
         return True
 
-    def ingest(self, message):
+    def ingest(self, message, refresh_memory=True):
         chat_id = message.chat.id
         if not self._enabled(chat_id, "learning"):
             return False, "disabled"
@@ -236,7 +242,8 @@ class LearningService:
             log.info("Learning message accepted chat=%s count=%s", chat_id, count)
             if count == self.settings.min_training_messages:
                 log.info("Minimum training volume reached chat=%s", chat_id)
-            self._maybe_refresh_memory(chat_id)
+            if refresh_memory:
+                self._maybe_refresh_memory(chat_id)
         return inserted, None if inserted else "duplicate"
 
     def _maybe_refresh_memory(self, chat_id):
@@ -343,11 +350,42 @@ class LearningService:
 
     def _message_context(self, message):
         text = getattr(message, "text", "") or ""
+        reply = getattr(message, "reply_to_message", None)
+        reply_text = normalize_spaces(getattr(reply, "text", "") or "")
+        if reply_text:
+            text = f"Сообщение CyberChair, на которое отвечают: {reply_text[:500]}\nОтвет пользователя: {text}"
         user = getattr(message, "from_user", None)
         username = (getattr(user, "username", None) or "").casefold()
         if username == self.settings.creator_username:
             return f"Харакири (@{self.settings.creator_username}): {text}"
         return text
+
+    def _budget_exceeded(self, chat_id):
+        budget = max(0.0, float(self.settings.xai_daily_chat_budget_usd))
+        if not budget:
+            return False
+        report = self.llm_cost_diagnostics(chat_id, 24)["total"]
+        ticks = report.get("cost_usd_ticks")
+        return ticks is not None and ticks >= int(budget * TICKS_PER_USD)
+
+    def direct_response_diagnostics(self, chat_id, hours=24, current=None):
+        current = current or datetime.now(timezone.utc)
+        since = (current - timedelta(hours=hours)).isoformat()
+        events = self.repository(chat_id).routing_report(since)
+        received = events.get("direct_addresses", 0) + events.get("direct_replies", 0)
+        # A message that is both a mention and a reply is counted once as a reply.
+        answered = sum(events.get(f"route_{name}", 0) for name in ("local", "grok", "markov", "gif", "meme", "sticker"))
+        llm = self.llm_cost_diagnostics(chat_id, hours)["total"]
+        return {
+            "received": received,
+            "answered": answered,
+            "response_rate": 1.0 if received == 0 else min(1.0, answered / received),
+            "routes": {name: events.get(f"route_{name}", 0) for name in ("local", "grok", "markov", "gif", "meme", "sticker")},
+            "intents": {name: events.get(f"intent_{name}", 0) for name in ("trivial", "social", "substantive")},
+            "grok_fallback_local": events.get("grok_fallback_local", 0),
+            "grok_share": 0.0 if not answered else events.get("route_grok", 0) / answered,
+            "cost_usd_ticks": llm.get("cost_usd_ticks"),
+        }
 
     def generate_local(self, chat_id, input_text=None, decorate=True):
         state = self.status(chat_id)
@@ -523,6 +561,139 @@ class LearningService:
         ).digest()
         return int.from_bytes(digest[:8], "big") / 2**64
 
+    def _record_direct_result(self, chat_id, message, producer, result):
+        repository = self.repository(chat_id)
+        route = result.action if isinstance(result, MediaDecision) else producer
+        if route == "ai":
+            route = "grok"
+        repository.record_routing_event(f"route_{route}")
+        repository.record_generated(
+            (result.template_id or result.asset_id or "media")
+            if isinstance(result, MediaDecision) else result,
+            f"direct_{route}",
+        )
+        self._remember_policy_target(chat_id, message)
+        return result
+
+    def maybe_direct_reply(self, message, bot_id=None, bot_username=None,
+                           explicit_address=False):
+        """Return exactly one final producer result for an explicit address/reply."""
+        chat_id = message.chat.id
+        if not self._enabled(chat_id, "talk"):
+            return None
+        text = message.text or ""
+        reply = getattr(message, "reply_to_message", None)
+        reply_user = getattr(reply, "from_user", None)
+        direct_reply = bool(reply_user and bot_id and reply_user.id == bot_id)
+        mentioned = bool(bot_username and f"@{bot_username}".casefold() in text.casefold())
+        special = any(phrase in text.casefold() for phrase in self.settings.special_phrases)
+        if not (explicit_address or direct_reply or mentioned or special):
+            return None
+
+        repository = self.repository(chat_id)
+        repository.record_routing_event(
+            "direct_replies" if direct_reply else "direct_addresses"
+        )
+        subject = text
+        if explicit_address or special:
+            subject = self.persona._strip_chair_invocation(subject)
+        if mentioned and bot_username:
+            subject = re.sub(
+                rf"@{re.escape(bot_username)}\b", "", subject, flags=re.I
+            ).strip()
+
+        state = self.chat_state_analyzer.analyze(
+            repository,
+            incoming_message=message,
+            bot_id=bot_id,
+            last_target_user_id=self._last_policy_target_user.get(chat_id),
+            answered_message_ids=self._policy_answered_messages.get(chat_id, ()),
+        )
+        ai_available = self.llm_allowed(chat_id) and self.provider_available(chat_id)
+        budget_exceeded = self._budget_exceeded(chat_id)
+        social_ai_useful = (
+            direct_reply
+            and len(subject.split()) >= 8
+            and state.conversation_type in {"serious", "work"}
+        )
+        route = self.direct_router.decide(
+            subject,
+            direct_reply=direct_reply,
+            ai_available=ai_available,
+            budget_exceeded=budget_exceeded,
+            social_ai_useful=social_ai_useful,
+        )
+        repository.record_routing_event(f"intent_{route.intent}")
+        self._last_direct_decision[chat_id] = route
+
+        conversation = self.conversation_policy.decide(
+            state,
+            addressed=True,
+            local_allowed=route.producer != "grok",
+            llm_allowed=route.producer == "grok",
+            quiet_hours=False,
+        )
+        self._last_chat_state[chat_id] = state
+        self._last_conversation_decision[chat_id] = conversation
+
+        # Contextual media is a free final response only for non-substantive
+        # turns. A meme decision is skipped here because rendering failure must
+        # not consume the guaranteed direct reply.
+        if route.intent != SUBSTANTIVE and self.media_enabled(chat_id):
+            day_summary = repository.summary_for_day(self.memory.logical_day()) or {}
+            callbacks = self.persona.select_callbacks(
+                day_summary, repository.stable_memories(20), subject,
+                state.dominant_topic,
+            )
+            selected_memes = self.meme_lexicon.select(
+                subject, {state.conversation_type, conversation.preferred_style},
+                conversation.troll_intensity, limit=1,
+            )
+            media = self.media.decide(
+                chat_id, repository, conversation, state,
+                self.memory.short_term_rows(repository), subject,
+                selected_memes, callbacks, self.troll_mode(chat_id),
+                self._deterministic_media_roll(chat_id, getattr(message, "message_id", 0), "direct_media"),
+                self._deterministic_media_roll(chat_id, getattr(message, "message_id", 0), "direct_meme"),
+                self._deterministic_media_roll(chat_id, getattr(message, "message_id", 0), "direct_reaction"),
+            )
+            if media.action in {"gif", "sticker"}:
+                self.media.commit(repository, media)
+                return self._record_direct_result(chat_id, message, media.action, media)
+
+        if route.producer == "grok":
+            result = self.generate_openai(
+                chat_id, self._message_context(message), "reply",
+                conversation_decision=conversation, chat_state=state,
+            )
+            if result:
+                return self._record_direct_result(chat_id, message, "grok", result)
+            repository.record_routing_event("grok_fallback_local")
+
+        # Markov is an occasional SOCIAL producer and is selected before local
+        # generation, never next to a successful AI/media response.
+        if (
+            route.intent == SOCIAL
+            and self.status(chat_id)["ready"]
+            and self.rng.random() < max(0.0, min(1.0, self.settings.direct_social_markov_share))
+        ):
+            result = self.generate_local(chat_id, subject)
+            if result and not self._chair_call_meta_joke_on_cooldown(chat_id, result):
+                return self._record_direct_result(chat_id, message, "markov", result)
+
+        result, memes = self.local_responder.respond(
+            chat_id, subject, route.intent, repository,
+            self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
+            self.troll_mode(chat_id),
+        )
+        if memes:
+            self.persona.record_usage(
+                chat_id,
+                tuple(item.id for item in memes),
+                tuple(item.cooldown_group for item in memes),
+            )
+        return self._record_direct_result(chat_id, message, "local", result)
+
     def maybe_reply(self, message, bot_id=None, bot_username=None):
         chat_id = message.chat.id
         if not self._enabled(chat_id, "talk"):
@@ -534,6 +705,11 @@ class LearningService:
         mentioned = bool(bot_username and f"@{bot_username}".casefold() in text.casefold())
         special = any(phrase in text.casefold() for phrase in self.settings.special_phrases)
         addressed = replies_to_bot or mentioned or special
+        if addressed:
+            return self.maybe_direct_reply(
+                message, bot_id=bot_id, bot_username=bot_username,
+                explicit_address=False,
+            )
         if not self.troll_mode(chat_id) and not addressed:
             return None
         state = self.chat_state_analyzer.analyze(

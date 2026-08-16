@@ -138,6 +138,10 @@ class LearningSettings:
     summary_max_output_tokens: int = field(default_factory=lambda: _int("SUMMARY_MAX_OUTPUT_TOKENS", 240))
     xai_base_url: str = field(default_factory=lambda: os.getenv("XAI_BASE_URL", "https://api.x.ai/v1"))
     xai_timeout: float = field(default_factory=lambda: _float("XAI_TIMEOUT", 60.0))
+    # Zero disables the soft budget. It is intentionally priority-aware: P1/P2
+    # stay local while useful P3 questions may still use the configured model.
+    xai_daily_chat_budget_usd: float = field(default_factory=lambda: _float("XAI_DAILY_CHAT_BUDGET_USD", 0.0))
+    direct_social_markov_share: float = field(default_factory=lambda: _float("DIRECT_SOCIAL_MARKOV_SHARE", 0.12))
     gif_enabled: bool = field(default_factory=lambda: _bool("GIF_ENABLED", True))
     gif_post_chance: float = field(default_factory=lambda: _float("GIF_POST_CHANCE", 0.65))
     gif_post_cooldown: int = field(default_factory=lambda: _int("GIF_POST_COOLDOWN", 3600))
