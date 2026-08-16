@@ -17,6 +17,14 @@ class MediaDecision:
     asset_key: str | None = None
     cooldown_group: str | None = None
     archetype: str | None = None
+    background_file_id: str | None = None
+    background_file_unique_id: str | None = None
+    background_media_type: str | None = None
+    background_mime_type: str | None = None
+    background_user_id: int | None = None
+    background_message_id: int | None = None
+    background_explicit: bool = False
+    render_profile: str | None = None
 
     def debug(self):
         return asdict(self)
@@ -36,6 +44,94 @@ class MediaService:
 
     def _recent(self, repository):
         return repository.recent_media_usage(self.settings.media_recent_limit)
+
+    @staticmethod
+    def _as_utc(value):
+        if not value:
+            return None
+        try:
+            moment = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc)
+
+    def score_chat_images(self, repository, current_text="", current_user_id=None,
+                          current=None):
+        """Rank reusable human images without turning the archive into roulette."""
+        current = current or datetime.now(timezone.utc)
+        rows = repository.chat_image_candidates()
+        recent_messages = repository.recent_messages(40)
+        current_terms = set(normalize_memory(current_text).split())
+        for row in recent_messages[-12:]:
+            current_terms.update(normalize_memory(row.get("text") or "").split())
+        active_users = {row.get("user_id") for row in recent_messages[-12:]}
+        recent_usage = repository.recent_chat_image_usage(8)
+        recent_ids = [row["file_unique_id"] for row in recent_usage]
+        recent_authors = [row.get("user_id") for row in recent_usage[:3]]
+        scored = []
+        for row in rows:
+            if row.get("from_bot") or not row.get("file_id"):
+                continue
+            created = self._as_utc(row.get("created_at"))
+            age_days = (current - created).total_seconds() / 86400 if created else 3650
+            if age_days <= 1:
+                score = 5.0
+            elif age_days <= 7:
+                score = 3.5
+            elif age_days <= 30:
+                score = 1.5
+            else:
+                score = -1.0
+            caption_terms = set(normalize_memory(row.get("caption") or "").split())
+            overlap = sum(
+                1 for word in caption_terms
+                if any(
+                    word == term
+                    or (min(len(word), len(term)) >= 5 and word[:5] == term[:5])
+                    for term in current_terms
+                )
+            )
+            score += min(9.0, overlap * 2.25)
+            score += min(4.0, float(row.get("reply_count") or 0) * 1.25)
+            score += min(3.0, float(row.get("nearby_message_count") or 0) * .25)
+            if row.get("user_id") in active_users:
+                score += 2.0
+            if current_user_id is not None and row.get("user_id") == current_user_id:
+                score += 1.0
+            used_count = int(row.get("used_count") or 0)
+            if not used_count:
+                score += 4.0
+            else:
+                score -= min(6.0, used_count * 1.4)
+            last_used = self._as_utc(row.get("last_used_at"))
+            if last_used:
+                hours = (current - last_used).total_seconds() / 3600
+                score += -8.0 if hours < 24 else -3.0 if hours < 168 else 1.0
+            if recent_ids and row["file_unique_id"] == recent_ids[0]:
+                continue
+            score -= recent_ids.count(row["file_unique_id"]) * 4.0
+            score -= recent_authors.count(row.get("user_id")) * 2.0
+            item = dict(row)
+            item["score"] = score
+            item["topic_overlap"] = overlap
+            scored.append(item)
+        return sorted(
+            scored,
+            key=lambda item: (item["score"], item.get("created_at") or ""),
+            reverse=True,
+        )
+
+    def select_chat_image(self, repository, current_text="", current_user_id=None):
+        ranked = self.score_chat_images(repository, current_text, current_user_id)
+        if not ranked:
+            return None
+        # Keep a little variety among genuinely competitive candidates while
+        # making relevance, recency and anti-repeat penalties decisive.
+        best = ranked[0]["score"]
+        pool = [row for row in ranked[:5] if row["score"] >= best - 2.5]
+        return self.rng.choice(pool)
 
     def _cooldown_active(self, repository, action=None, asset_key=None, group=None, seconds=None):
         seconds = self.settings.media_cooldown if seconds is None else seconds

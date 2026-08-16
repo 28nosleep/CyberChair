@@ -5,6 +5,7 @@ import threading
 import hashlib
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from .filters import similarity, validate_generated
@@ -49,6 +50,11 @@ CHAIR_CALL_META_JOKE_RE = re.compile(
     r".{0,30}(?:стул|меня)|(?:зов[её]те|ор[её]те|кличете).{0,30}(?:стул|меня)",
     re.I,
 )
+
+SAFE_CHAT_IMAGE_MIME_TYPES = {
+    "image/jpeg", "image/jpg", "image/png", "image/webp",
+    "image/gif", "image/bmp", "image/tiff",
+}
 
 
 class LearningService:
@@ -116,7 +122,19 @@ class LearningService:
         self._voice_cooldown_notices = {}
         self._command_meme_sources = {}
         self._clock = clock or time.monotonic
+        # Optional Telegram-layer UX hook. Core routing remains transport-free.
+        self.response_activity = None
         self._lock = threading.RLock()
+
+    def _response_activity(self, chat_id, action="typing", producer=None):
+        if self.response_activity is None:
+            return nullcontext(None)
+        return self.response_activity(chat_id, action, producer)
+
+    @staticmethod
+    def _ensure_action_visible(session, producer, text):
+        if session is not None and hasattr(session, "ensure_visible"):
+            session.ensure_visible(producer, text)
 
     def repository(self, chat_id):
         with self._lock:
@@ -661,38 +679,46 @@ class LearningService:
                 self.media.commit(repository, media)
                 return self._record_direct_result(chat_id, message, media.action, media)
 
-        if route.producer == "grok":
-            result = self.generate_openai(
-                chat_id, self._message_context(message), "reply",
-                conversation_decision=conversation, chat_state=state,
-            )
-            if result:
-                return self._record_direct_result(chat_id, message, "grok", result)
-            repository.record_routing_event("grok_fallback_local")
-
-        # Markov is an occasional SOCIAL producer and is selected before local
-        # generation, never next to a successful AI/media response.
-        if (
-            route.intent == SOCIAL
+        markov_selected = (
+            route.producer != "grok"
+            and route.intent == SOCIAL
             and self.status(chat_id)["ready"]
             and self.rng.random() < max(0.0, min(1.0, self.settings.direct_social_markov_share))
-        ):
-            result = self.generate_local(chat_id, subject)
-            if result and not self._chair_call_meta_joke_on_cooldown(chat_id, result):
-                return self._record_direct_result(chat_id, message, "markov", result)
-
-        result, memes = self.local_responder.respond(
-            chat_id, subject, route.intent, repository,
-            self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
-            self.troll_mode(chat_id),
         )
-        if memes:
-            self.persona.record_usage(
-                chat_id,
-                tuple(item.id for item in memes),
-                tuple(item.cooldown_group for item in memes),
+        selected_producer = "grok" if route.producer == "grok" else (
+            "markov" if markov_selected else "local"
+        )
+        with self._response_activity(chat_id, "typing", selected_producer) as action:
+            if route.producer == "grok":
+                result = self.generate_openai(
+                    chat_id, self._message_context(message), "reply",
+                    conversation_decision=conversation, chat_state=state,
+                )
+                if result:
+                    return self._record_direct_result(chat_id, message, "grok", result)
+                repository.record_routing_event("grok_fallback_local")
+
+            # Markov is an occasional SOCIAL producer and is selected before
+            # generation, never next to a successful AI/media response.
+            if markov_selected:
+                result = self.generate_local(chat_id, subject)
+                if result and not self._chair_call_meta_joke_on_cooldown(chat_id, result):
+                    self._ensure_action_visible(action, "markov", result)
+                    return self._record_direct_result(chat_id, message, "markov", result)
+
+            result, memes = self.local_responder.respond(
+                chat_id, subject, route.intent, repository,
+                self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
+                self.troll_mode(chat_id),
             )
-        return self._record_direct_result(chat_id, message, "local", result)
+            if memes:
+                self.persona.record_usage(
+                    chat_id,
+                    tuple(item.id for item in memes),
+                    tuple(item.cooldown_group for item in memes),
+                )
+            self._ensure_action_visible(action, "local", result)
+            return self._record_direct_result(chat_id, message, "local", result)
 
     def maybe_reply(self, message, bot_id=None, bot_username=None):
         chat_id = message.chat.id
@@ -811,19 +837,21 @@ class LearningService:
             return media_decision
         # Addressed replies use the selected provider. Ordinary random replies
         # may still use the existing local generator.
-        if kind in {"addressed", "openai_random"}:
-            purpose = "reply" if kind == "addressed" else "random_reply"
-            result = self.generate_openai(
-                chat_id,
-                self._message_context(message),
-                purpose,
-                conversation_decision=decision,
-                chat_state=state,
-            )
-            provider = "ai"
-        else:
-            result = self.generate_local(chat_id, text)
-            provider = "markov"
+        provider = "grok" if kind in {"addressed", "openai_random"} else "markov"
+        with self._response_activity(chat_id, "typing", provider) as action:
+            if provider == "grok":
+                purpose = "reply" if kind == "addressed" else "random_reply"
+                result = self.generate_openai(
+                    chat_id,
+                    self._message_context(message),
+                    purpose,
+                    conversation_decision=decision,
+                    chat_state=state,
+                )
+            else:
+                result = self.generate_local(chat_id, text)
+            if result:
+                self._ensure_action_visible(action, provider, result)
         if result:
             self.triggers.commit(chat_id, kind)
             self.repository(chat_id).record_generated(result, kind)
@@ -844,7 +872,10 @@ class LearningService:
             return None
         if self.rng.random() >= chance:
             return None
-        result = self.generate_openai(chat_id, self._message_context(message), purpose)
+        with self._response_activity(chat_id, "typing", "grok"):
+            result = self.generate_openai(
+                chat_id, self._message_context(message), purpose
+            )
         if result:
             self.triggers.commit(chat_id, kind)
             self.repository(chat_id).record_generated(result, kind)
@@ -956,11 +987,12 @@ class LearningService:
             return None
         if not self.triggers.allowed(chat_id, "chair_question", addressed=True):
             return None
-        result = self.generate_openai(
-            chat_id,
-            self._message_context(message),
-            "question",
-        )
+        with self._response_activity(chat_id, "typing", "grok"):
+            result = self.generate_openai(
+                chat_id,
+                self._message_context(message),
+                "question",
+            )
         if result:
             self.triggers.commit(chat_id, "chair_question")
             self.repository(chat_id).record_generated(result, "chair_question")
@@ -977,7 +1009,8 @@ class LearningService:
         if self.repository(chat_id).generated_since(since, "voice_story"):
             return None
         # The invocation is a control command, not story context or memory.
-        result = self.generate_openai(chat_id, None, "voice_story")
+        with self._response_activity(chat_id, "typing", "grok"):
+            result = self.generate_openai(chat_id, None, "voice_story")
         if result:
             self.repository(chat_id).record_generated(result, "voice_story")
         return result
@@ -1021,7 +1054,8 @@ class LearningService:
             return None
         if not self.triggers.allowed(chat_id, "sglypa", addressed=True):
             return None
-        result = self.generate_openai(chat_id, message.text, "sglypa")
+        with self._response_activity(chat_id, "typing", "grok"):
+            result = self.generate_openai(chat_id, message.text, "sglypa")
         if not result:
             return None
         self.triggers.commit(chat_id, "sglypa")
@@ -1125,9 +1159,10 @@ class LearningService:
             return media
         if not self.provider_available(chat_id):
             return None
-        result = self.generate_openai(
-            chat_id, target_text or None, "autonomous", decision, state
-        )
+        with self._response_activity(chat_id, "typing", "grok"):
+            result = self.generate_openai(
+                chat_id, target_text or None, "autonomous", decision, state
+            )
         if not result:
             return None
         self.triggers.commit(chat_id, "autonomous")
@@ -1192,6 +1227,65 @@ class LearningService:
             )
         return inserted
 
+    @staticmethod
+    def telegram_image_metadata(message):
+        """Extract the largest Telegram photo or a safe image document."""
+        if message is None:
+            return None
+        user = getattr(message, "from_user", None)
+        from_bot = bool(user and getattr(user, "is_bot", False))
+        photos = list(getattr(message, "photo", None) or ())
+        if photos:
+            media = max(
+                photos,
+                key=lambda item: (
+                    int(getattr(item, "width", 0) or 0)
+                    * int(getattr(item, "height", 0) or 0),
+                    int(getattr(item, "file_size", 0) or 0),
+                ),
+            )
+            media_type, mime_type = "photo", "image/jpeg"
+        else:
+            media = getattr(message, "document", None)
+            mime_type = str(getattr(media, "mime_type", "") or "").casefold()
+            if not media or mime_type not in SAFE_CHAT_IMAGE_MIME_TYPES:
+                return None
+            media_type = "document"
+        file_id = getattr(media, "file_id", None)
+        if not file_id:
+            return None
+        return {
+            "message_id": getattr(message, "message_id", getattr(message, "id", 0)),
+            "user_id": getattr(user, "id", None),
+            "file_id": file_id,
+            "file_unique_id": getattr(media, "file_unique_id", file_id),
+            "media_type": media_type,
+            "mime_type": mime_type,
+            "caption": normalize_spaces(getattr(message, "caption", "") or ""),
+            "file_size": getattr(media, "file_size", None),
+            "width": getattr(media, "width", None),
+            "height": getattr(media, "height", None),
+            "from_bot": from_bot,
+            "created_at": (
+                datetime.fromtimestamp(getattr(message, "date", 0), timezone.utc)
+                if getattr(message, "date", 0) else None
+            ),
+        }
+
+    def ingest_chat_image(self, message):
+        metadata = self.telegram_image_metadata(message)
+        if not metadata:
+            return False
+        inserted = self.repository(message.chat.id).add_chat_image(
+            **metadata, max_images=self.settings.max_chat_images_per_chat
+        )
+        if inserted:
+            log.info(
+                "Chat image metadata accepted chat=%s message=%s from_bot=%s",
+                message.chat.id, metadata["message_id"], metadata["from_bot"],
+            )
+        return inserted
+
     def maybe_random_media(self, chat_id):
         if (
             not self.troll_mode(chat_id)
@@ -1215,9 +1309,18 @@ class LearningService:
         log.info("Random media selected chat=%s type=%s", chat_id, media_type)
         return media_type, decision.asset_id
 
-    def render_meme(self, decision):
+    def render_meme(self, decision, source_path=None):
         if not isinstance(decision, MediaDecision) or decision.action != "meme":
             return None
+        if source_path is not None and decision.background_file_id:
+            return self.meme_renderer.render_image(
+                source_path,
+                decision.caption_text,
+                decision.render_profile or "top_caption",
+                max_bytes=self.settings.max_chat_image_bytes,
+                max_dimension=self.settings.max_chat_image_dimension,
+                max_pixels=self.settings.max_chat_image_pixels,
+            )
         return self.meme_renderer.render(decision.template_id, decision.caption_text)
 
     def startup_meme(self, chat_id=None):
@@ -1256,11 +1359,77 @@ class LearningService:
         ).isoformat()
         return bool(self.repository(chat_id).generated_since(since, "manual_meme"))
 
-    def maybe_command_meme(self, chat_id):
+    def _curated_command_background(self, recent_templates=()):
+        candidates = [
+            asset for asset in self.media_catalog.assets
+            if asset.type == "meme_template" and self.media_catalog.resolve(asset)
+        ]
+        if not candidates:
+            return None
+        unused = [asset for asset in candidates if asset.id not in recent_templates]
+        return self.rng.choice(unused or candidates)
+
+    def _command_background_decision(self, decision, asset):
+        if not asset:
+            return None
+        values = decision.debug()
+        values.update({
+            "asset_id": asset.id,
+            "template_id": asset.id,
+            "asset_key": asset.id,
+            "cooldown_group": asset.cooldown_group,
+            "archetype": asset.archetype,
+            "background_file_id": None,
+            "background_file_unique_id": None,
+            "background_media_type": None,
+            "background_mime_type": None,
+            "background_user_id": None,
+            "background_message_id": None,
+            "background_explicit": False,
+            "render_profile": None,
+        })
+        return MediaDecision(**values)
+
+    def fallback_command_meme_background(self, decision, chat_id):
+        """Choose a curated template only after a chat image failed validation."""
+        asset = self._curated_command_background(
+            self.meme_sources.recent_templates(chat_id)
+        )
+        fallback = self._command_background_decision(decision, asset)
+        if fallback is not None and decision in self._command_meme_sources:
+            self._command_meme_sources[fallback] = self._command_meme_sources.pop(decision)
+        return fallback
+
+    def maybe_command_meme(self, chat_or_message, hint=""):
         """Always make a meme; AI cooldown only switches its caption source."""
+        message = chat_or_message if hasattr(chat_or_message, "chat") else None
+        chat_id = message.chat.id if message is not None else int(chat_or_message)
         if not self.media_enabled(chat_id):
             return None
         repository = self.repository(chat_id)
+        reply = getattr(message, "reply_to_message", None) if message is not None else None
+        explicit_image = self.telegram_image_metadata(reply)
+        if explicit_image:
+            # Preserve metadata even when an old update was missed. Bot media is
+            # stored for audit/regression purposes but is never selectable.
+            repository.add_chat_image(
+                **explicit_image, max_images=self.settings.max_chat_images_per_chat
+            )
+        explicit_usable = bool(
+            explicit_image
+            and not explicit_image["from_bot"]
+            and (explicit_image.get("file_size") or 0) <= self.settings.max_chat_image_bytes
+            and max(explicit_image.get("width") or 0, explicit_image.get("height") or 0)
+                <= self.settings.max_chat_image_dimension
+        )
+        # A reply to a non-image/bot image is an explicit but unusable choice:
+        # safely fall back to curated media rather than substituting an unrelated
+        # image from chat history.
+        force_curated = reply is not None and not explicit_usable
+        hint = normalize_spaces(hint)
+        background_context = normalize_spaces(
+            f"{hint} {(explicit_image or {}).get('caption', '')}"
+        )
         rows = repository.meme_source_messages()
         summary = repository.summary_for_day(self.memory.logical_day()) or {}
         callbacks = self.persona.select_callbacks(
@@ -1272,11 +1441,19 @@ class LearningService:
             and not self.meme_command_on_cooldown(chat_id)
         )
         source = self.meme_sources.choose(
-            chat_id, rows, callbacks, fallback=not ai_ready
+            chat_id, rows, callbacks, current_text=background_context,
+            topic=hint, fallback=not ai_ready
         )
         caption = None
         if ai_ready:
-            context = source.text or None
+            context = normalize_spaces(
+                " | ".join(value for value in (
+                    f"Пожелание к мему: {hint}" if hint else "",
+                    f"Подпись исходной картинки: {explicit_image.get('caption')}"
+                    if explicit_image and explicit_image.get("caption") else "",
+                    source.text,
+                ) if value)
+            ) or None
             caption = self.generate_openai(chat_id, context, "meme_caption")
             # An event that selected AI never cascades into Markov/local output.
             if not caption:
@@ -1285,21 +1462,50 @@ class LearningService:
             source, caption = self._local_command_caption(chat_id, source, rows, callbacks)
         if not caption:
             return None
-        candidates = [
-            asset for asset in self.media_catalog.assets
-            if asset.type == "meme_template" and self.media_catalog.resolve(asset)
-        ]
-        if not candidates:
-            return None
-        unused = [asset for asset in candidates if asset.id not in self.meme_sources.recent_templates(chat_id)]
-        asset = self.rng.choice(unused or candidates)
-        decision = MediaDecision(
-            action="meme", asset_id=asset.id, template_id=asset.id,
+        base = MediaDecision(
+            action="meme",
             source_message_id=source.message_id, caption_text=caption, confidence=1.0,
             reason=f"manual_{'ai' if ai_ready else 'local'}_{source.kind}",
-            asset_key=asset.id, cooldown_group=asset.cooldown_group,
-            archetype=asset.archetype,
         )
+        image = explicit_image if explicit_usable else None
+        if image is None and not force_curated:
+            chance = max(0.0, min(1.0, self.settings.chat_image_background_chance))
+            if self.rng.random() < chance:
+                ranked = self.media.score_chat_images(
+                    repository, background_context or source.text,
+                    getattr(getattr(message, "from_user", None), "id", None),
+                )
+                caption_hash = hashlib.sha256(caption.casefold().encode("utf-8")).hexdigest()[:20]
+                image = next((
+                    row for row in ranked
+                    if not repository.chat_image_caption_used(
+                        row["file_unique_id"], caption_hash
+                    )
+                ), None)
+        if image is not None:
+            profile = self.rng.choice(("top_caption", "bottom_caption", "top_bottom"))
+            values = base.debug()
+            values.update({
+                "background_file_id": image["file_id"],
+                "background_file_unique_id": image["file_unique_id"],
+                "background_media_type": image["media_type"],
+                "background_mime_type": image.get("mime_type"),
+                "background_user_id": image.get("user_id"),
+                "background_message_id": image.get("message_id"),
+                "background_explicit": bool(explicit_usable),
+                "render_profile": profile,
+                "asset_key": f"chat_image:{image['file_unique_id']}",
+                "cooldown_group": "chat_image",
+                "archetype": "chat_image",
+            })
+            decision = MediaDecision(**values)
+        else:
+            asset = self._curated_command_background(
+                self.meme_sources.recent_templates(chat_id)
+            )
+            decision = self._command_background_decision(base, asset)
+            if decision is None:
+                return None
         self._command_meme_sources[decision] = source
         return decision
 
@@ -1336,6 +1542,15 @@ class LearningService:
         repository = self.repository(chat_id)
         self.media.commit(repository, decision)
         repository.record_generated(decision.template_id or "manual_meme", "manual_meme")
+        if decision.background_file_unique_id:
+            caption_hash = hashlib.sha256(
+                (decision.caption_text or "").casefold().encode("utf-8")
+            ).hexdigest()[:20]
+            repository.mark_chat_image_used(
+                decision.background_file_unique_id,
+                caption_hash,
+                decision.background_user_id,
+            )
         source = self._command_meme_sources.pop(
             decision,
             MemeSource((decision.reason or "").rsplit("_", 1)[-1], "", decision.source_message_id),

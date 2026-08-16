@@ -104,6 +104,38 @@ class ChatRepository:
                     UNIQUE(chat_id, file_unique_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_stickers_used ON stickers(last_used_at);
+                CREATE TABLE IF NOT EXISTS chat_images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    user_id INTEGER,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    mime_type TEXT,
+                    caption TEXT,
+                    file_size INTEGER,
+                    width INTEGER,
+                    height INTEGER,
+                    created_at TEXT NOT NULL,
+                    from_bot INTEGER NOT NULL DEFAULT 0,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    last_used_at TEXT,
+                    UNIQUE(chat_id, file_unique_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_images_created
+                    ON chat_images(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_images_used
+                    ON chat_images(last_used_at);
+                CREATE TABLE IF NOT EXISTS chat_image_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_unique_id TEXT NOT NULL,
+                    user_id INTEGER,
+                    caption_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_image_usage_created
+                    ON chat_image_usage(created_at DESC);
                 CREATE TABLE IF NOT EXISTS daily_summaries (
                     day TEXT PRIMARY KEY,
                     summary_json TEXT NOT NULL,
@@ -850,6 +882,117 @@ class ChatRepository:
                 db.execute("DELETE FROM stickers WHERE id IN (SELECT id FROM stickers ORDER BY id LIMIT ?)", (overflow,))
             return cursor.rowcount > 0
 
+    def add_chat_image(self, message_id, user_id, file_id, file_unique_id,
+                       media_type, mime_type=None, caption=None, file_size=None,
+                       width=None, height=None, from_bot=False, created_at=None,
+                       max_images=2000):
+        """Keep Telegram metadata only; duplicate files refresh their file_id."""
+        created_at = created_at or datetime.now(timezone.utc)
+        stamp = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+        with self._lock, closing(self._connect()) as db, db:
+            existed = db.execute(
+                "SELECT 1 FROM chat_images WHERE chat_id = ? AND file_unique_id = ?",
+                (self.chat_id, str(file_unique_id)),
+            ).fetchone()
+            db.execute(
+                """INSERT INTO chat_images
+                (chat_id, message_id, user_id, file_id, file_unique_id,
+                 media_type, mime_type, caption, file_size, width, height,
+                 created_at, from_bot)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, file_unique_id) DO UPDATE SET
+                    message_id=excluded.message_id,
+                    user_id=excluded.user_id,
+                    file_id=excluded.file_id,
+                    media_type=excluded.media_type,
+                    mime_type=excluded.mime_type,
+                    caption=CASE WHEN excluded.caption != '' THEN excluded.caption ELSE chat_images.caption END,
+                    file_size=COALESCE(excluded.file_size, chat_images.file_size),
+                    width=COALESCE(excluded.width, chat_images.width),
+                    height=COALESCE(excluded.height, chat_images.height),
+                    from_bot=MAX(chat_images.from_bot, excluded.from_bot)""",
+                (
+                    self.chat_id, int(message_id), user_id, str(file_id),
+                    str(file_unique_id), str(media_type), mime_type,
+                    str(caption or "")[:1000], file_size, width, height, stamp,
+                    int(bool(from_bot)),
+                ),
+            )
+            overflow = db.execute(
+                "SELECT COUNT(*) - ? FROM chat_images", (int(max_images),)
+            ).fetchone()[0]
+            if overflow > 0:
+                db.execute(
+                    "DELETE FROM chat_images WHERE id IN "
+                    "(SELECT id FROM chat_images ORDER BY id LIMIT ?)",
+                    (overflow,),
+                )
+            return not bool(existed)
+
+    def chat_image_count(self):
+        with self._lock, closing(self._connect()) as db, db:
+            return db.execute("SELECT COUNT(*) FROM chat_images").fetchone()[0]
+
+    def chat_image_by_unique_id(self, file_unique_id):
+        with self._lock, closing(self._connect()) as db, db:
+            row = db.execute(
+                "SELECT * FROM chat_images WHERE file_unique_id = ? LIMIT 1",
+                (str(file_unique_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def chat_image_candidates(self, limit=2000):
+        """Return human images with lightweight conversation engagement signals."""
+        with self._lock, closing(self._connect()) as db, db:
+            rows = db.execute(
+                """SELECT image.*,
+                    (SELECT COUNT(*) FROM messages reply
+                     WHERE reply.reply_to_message_id = image.message_id) AS reply_count,
+                    (SELECT COUNT(*) FROM messages nearby
+                     WHERE ABS(
+                        (julianday(nearby.created_at) - julianday(image.created_at)) * 1440
+                     ) <= 30) AS nearby_message_count
+                FROM chat_images image
+                WHERE image.from_bot = 0
+                ORDER BY image.created_at DESC LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_chat_image_usage(self, limit=12):
+        with self._lock, closing(self._connect()) as db, db:
+            rows = db.execute(
+                "SELECT * FROM chat_image_usage ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def chat_image_caption_used(self, file_unique_id, caption_hash):
+        with self._lock, closing(self._connect()) as db, db:
+            return bool(db.execute(
+                "SELECT 1 FROM chat_image_usage WHERE file_unique_id = ? "
+                "AND caption_hash = ? LIMIT 1",
+                (str(file_unique_id), str(caption_hash)),
+            ).fetchone())
+
+    def mark_chat_image_used(self, file_unique_id, caption_hash, user_id=None):
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                "UPDATE chat_images SET used_count = used_count + 1, last_used_at = ? "
+                "WHERE file_unique_id = ?",
+                (stamp, str(file_unique_id)),
+            )
+            db.execute(
+                "INSERT INTO chat_image_usage(file_unique_id, user_id, caption_hash, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (str(file_unique_id), user_id, str(caption_hash), stamp),
+            )
+            db.execute(
+                "DELETE FROM chat_image_usage WHERE id NOT IN "
+                "(SELECT id FROM chat_image_usage ORDER BY id DESC LIMIT 500)"
+            )
+
     def sticker_count(self):
         with self._lock, closing(self._connect()) as db, db:
             return db.execute("SELECT COUNT(*) FROM stickers").fetchone()[0]
@@ -950,6 +1093,8 @@ class ChatRepository:
             db.execute("DELETE FROM generated")
             db.execute("DELETE FROM gifs")
             db.execute("DELETE FROM stickers")
+            db.execute("DELETE FROM chat_images")
+            db.execute("DELETE FROM chat_image_usage")
             db.execute("DELETE FROM daily_summaries")
             db.execute("DELETE FROM long_memories")
             db.execute("DELETE FROM memory_candidates")

@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 from html import escape
@@ -36,7 +37,13 @@ from messages import (
     format_movie_quote,
 )
 
-from learning import LearningService, LearningSettings, MediaDecision
+from learning import (
+    ChatActionManager,
+    LearningService,
+    LearningSettings,
+    MEDIA_CHAT_ACTIONS,
+    MediaDecision,
+)
 from learning.preprocessing import FOREIGN_BOT_COMMAND_RE, VOICE_STORY_COMMAND_RE
 
 # ==========================================
@@ -58,6 +65,8 @@ TIMEZONE = "Europe/Moscow"
 bot = telebot.TeleBot(TOKEN)
 learning_settings = LearningSettings()
 learning_service = LearningService(learning_settings)
+chat_action_manager = ChatActionManager(bot)
+learning_service.response_activity = chat_action_manager.activity
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -78,7 +87,9 @@ SGLYPA_REPLY_COOLDOWN = 15
 SGLYPA_USERNAME = "sglypa_tg_bot"
 FREEKUCHER_REPLY_COOLDOWN = 60
 CHAIR_REMAINING_COMMAND_RE = re.compile(r"^\s*с\s+стул\s*$", re.IGNORECASE)
-CHAIR_MEME_COMMAND_RE = re.compile(r"^\s*с\s+м\s+стул\s*$", re.IGNORECASE)
+CHAIR_MEME_COMMAND_RE = re.compile(
+    r"^\s*с\s+м\s+стул(?:\s+(?P<hint>.+?))?\s*$", re.IGNORECASE
+)
 
 bot_state = {
     "known_users": {},
@@ -480,24 +491,81 @@ def send_startup_meme():
         learning_service.cleanup_rendered_meme(rendered)
 
 
-def send_manual_meme(message, decision):
-    rendered = learning_service.render_meme(decision)
-    if not rendered:
-        return False
+def download_chat_image(file_id):
+    """Download a Telegram image into a bounded, short-lived local file."""
+    source_path = None
     try:
-        with rendered.path.open("rb") as image:
-            bot.send_photo(
-                message.chat.id, image, reply_to_message_id=message.message_id,
-            )
-        learning_service.mark_command_meme_sent(message.chat.id, decision)
-        return True
+        telegram_file = bot.get_file(file_id)
+        remote_size = int(getattr(telegram_file, "file_size", 0) or 0)
+        if remote_size > learning_settings.max_chat_image_bytes:
+            return None
+        payload = bot.download_file(telegram_file.file_path)
+        if not payload or len(payload) > learning_settings.max_chat_image_bytes:
+            return None
+        suffix = Path(getattr(telegram_file, "file_path", "image") or "image").suffix[:10]
+        fd, raw_path = tempfile.mkstemp(prefix="cyberchair_source_", suffix=suffix)
+        os.close(fd)
+        source_path = Path(raw_path)
+        source_path.write_bytes(payload)
+        return source_path
     except Exception as error:
+        if source_path is not None:
+            source_path.unlink(missing_ok=True)
         logging.getLogger(__name__).warning(
-            "Не удалось отправить мем по команде: %s", type(error).__name__
+            "Не удалось временно скачать chat image: %s", type(error).__name__
         )
-        return False
-    finally:
-        learning_service.cleanup_rendered_meme(rendered)
+        return None
+
+
+def send_manual_meme(message, decision=None, hint=""):
+    with chat_action_manager.activity(
+        message.chat.id, MEDIA_CHAT_ACTIONS["meme"], "meme"
+    ):
+        if decision is None:
+            decision = learning_service.maybe_command_meme(message, hint)
+        if not decision:
+            return False
+        rendered = None
+        source_path = None
+        used_decision = decision
+        try:
+            if decision.background_file_id:
+                source_path = download_chat_image(decision.background_file_id)
+                if source_path is not None:
+                    rendered = learning_service.render_meme(decision, source_path)
+                if rendered is None:
+                    used_decision = learning_service.fallback_command_meme_background(
+                        decision, message.chat.id
+                    )
+                    rendered = (
+                        learning_service.render_meme(used_decision)
+                        if used_decision else None
+                    )
+            else:
+                rendered = learning_service.render_meme(decision)
+            if not rendered:
+                return False
+            with rendered.path.open("rb") as image:
+                bot.send_photo(
+                    message.chat.id, image, reply_to_message_id=message.message_id,
+                )
+            learning_service.mark_command_meme_sent(message.chat.id, used_decision)
+            return True
+        except Exception as error:
+            logging.getLogger(__name__).warning(
+                "Не удалось отправить мем по команде: %s", type(error).__name__
+            )
+            return False
+        finally:
+            try:
+                if rendered is not None:
+                    learning_service.cleanup_rendered_meme(rendered)
+            finally:
+                if source_path is not None:
+                    try:
+                        source_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
 
 def user_mention(user):
@@ -950,37 +1018,46 @@ def send_contextual_response(message, response):
         bot.reply_to(message, response)
         return True
     if response.action == "gif":
-        bot.send_animation(
-            message.chat.id, response.asset_id,
-            reply_to_message_id=message.message_id,
-        )
-        return True
-    if response.action == "sticker":
-        bot.send_sticker(
-            message.chat.id, response.asset_id,
-            reply_to_message_id=message.message_id,
-        )
-        return True
-    if response.action != "meme":
-        return False
-    rendered = learning_service.render_meme(response)
-    if not rendered:
-        return False
-    try:
-        with rendered.path.open("rb") as image:
-            bot.send_photo(
-                message.chat.id, image,
+        with chat_action_manager.activity(
+            message.chat.id, MEDIA_CHAT_ACTIONS["gif"], "gif"
+        ):
+            bot.send_animation(
+                message.chat.id, response.asset_id,
                 reply_to_message_id=message.message_id,
             )
         return True
-    except OSError as error:
-        logging.getLogger(__name__).warning(
-            "Не удалось отправить contextual meme chat=%s: %s",
-            message.chat.id, type(error).__name__,
-        )
+    if response.action == "sticker":
+        with chat_action_manager.activity(
+            message.chat.id, MEDIA_CHAT_ACTIONS["sticker"], "sticker"
+        ):
+            bot.send_sticker(
+                message.chat.id, response.asset_id,
+                reply_to_message_id=message.message_id,
+            )
+        return True
+    if response.action != "meme":
         return False
-    finally:
-        learning_service.cleanup_rendered_meme(rendered)
+    with chat_action_manager.activity(
+        message.chat.id, MEDIA_CHAT_ACTIONS["meme"], "meme"
+    ):
+        rendered = learning_service.render_meme(response)
+        if not rendered:
+            return False
+        try:
+            with rendered.path.open("rb") as image:
+                bot.send_photo(
+                    message.chat.id, image,
+                    reply_to_message_id=message.message_id,
+                )
+            return True
+        except OSError as error:
+            logging.getLogger(__name__).warning(
+                "Не удалось отправить contextual meme chat=%s: %s",
+                message.chat.id, type(error).__name__,
+            )
+            return False
+        finally:
+            learning_service.cleanup_rendered_meme(rendered)
 
 
 def send_autonomous_response(chat_id, response):
@@ -989,22 +1066,31 @@ def send_autonomous_response(chat_id, response):
         bot.send_message(chat_id, response)
         return True
     if response.action == "gif":
-        bot.send_animation(chat_id, response.asset_id)
+        with chat_action_manager.activity(
+            chat_id, MEDIA_CHAT_ACTIONS["gif"], "gif"
+        ):
+            bot.send_animation(chat_id, response.asset_id)
         return True
     if response.action == "sticker":
-        bot.send_sticker(chat_id, response.asset_id)
+        with chat_action_manager.activity(
+            chat_id, MEDIA_CHAT_ACTIONS["sticker"], "sticker"
+        ):
+            bot.send_sticker(chat_id, response.asset_id)
         return True
     if response.action != "meme":
         return False
-    rendered = learning_service.render_meme(response)
-    if not rendered:
-        return False
-    try:
-        with rendered.path.open("rb") as image:
-            bot.send_photo(chat_id, image)
-        return True
-    finally:
-        learning_service.cleanup_rendered_meme(rendered)
+    with chat_action_manager.activity(
+        chat_id, MEDIA_CHAT_ACTIONS["meme"], "meme"
+    ):
+        rendered = learning_service.render_meme(response)
+        if not rendered:
+            return False
+        try:
+            with rendered.path.open("rb") as image:
+                bot.send_photo(chat_id, image)
+            return True
+        finally:
+            learning_service.cleanup_rendered_meme(rendered)
 
 
 @bot.message_handler(content_types=["animation"])
@@ -1012,15 +1098,22 @@ def remember_animation(message):
     learning_service.ingest_gif(message)
 
 
+@bot.message_handler(content_types=["photo"])
+def remember_photo(message):
+    learning_service.ingest_chat_image(message)
+
+
 @bot.message_handler(
     content_types=["document"],
     func=lambda m: bool(
         getattr(m, "document", None)
-        and getattr(m.document, "mime_type", "") == "image/gif"
+        and str(getattr(m.document, "mime_type", "") or "").casefold().startswith("image/")
     ),
 )
-def remember_gif_document(message):
-    learning_service.ingest_gif(message)
+def remember_image_document(message):
+    learning_service.ingest_chat_image(message)
+    if str(getattr(message.document, "mime_type", "") or "").casefold() == "image/gif":
+        learning_service.ingest_gif(message)
 
 
 @bot.message_handler(content_types=["sticker"])
@@ -1042,9 +1135,9 @@ def handle_message(message):
     if FOREIGN_BOT_COMMAND_RE.search(text):
         return
 
-    if CHAIR_MEME_COMMAND_RE.fullmatch(text):
-        decision = learning_service.maybe_command_meme(message.chat.id)
-        if decision and send_manual_meme(message, decision):
+    meme_match = CHAIR_MEME_COMMAND_RE.fullmatch(text)
+    if meme_match:
+        if send_manual_meme(message, hint=meme_match.group("hint") or ""):
             return
         logging.getLogger(__name__).warning("Не удалось собрать мем по команде chat=%s", message.chat.id)
         return

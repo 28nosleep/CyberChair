@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,8 +105,21 @@ class AutonomousServiceTests(unittest.TestCase):
 
     def test_selected_text_calls_llm_once_after_local_policy(self):
         provider = Mock(available=True)
-        provider.generate.return_value="ну релиз конечно кукд"
+        events = []
+
+        def generate(request):
+            events.append("llm")
+            return "ну релиз конечно кукд"
+
+        provider.generate.side_effect = generate
         service = LearningService(self.settings, llm_provider=provider)
+
+        @contextmanager
+        def activity(chat_id, action, producer=None):
+            events.append(action)
+            yield None
+
+        service.response_activity = activity
         repository = service.repository(-1)
         repository.add_message(1, 2, "u2", "релиз опять упал", NOW - timedelta(minutes=10))
         service.rng = SimpleNamespace(random=lambda: 0.0)
@@ -116,5 +130,6 @@ class AutonomousServiceTests(unittest.TestCase):
         ):
             result = service.maybe_autonomous(-1, NOW)
         self.assertEqual(result, "ну релиз конечно кукд")
+        self.assertEqual(events, ["typing", "llm"])
         provider.generate.assert_called_once()
         self.assertEqual(repository.latest_generated(("autonomous",))["kind"], "autonomous")
