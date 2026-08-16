@@ -119,6 +119,51 @@ class DirectAddressRoutingTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(service._last_direct_decision[-1].priority, "P3")
 
+    def test_how_to_runtime_pipeline_uses_grok_and_accepts_useful_long_answer(self):
+        answer = (
+            "сначала добейся узнаваемого звука, затем регулярно выпускай треки и сниппеты, "
+            "делай коллабы с артистами своего размера, играй лайвы и собирай вокруг имени "
+            "понятный образ: один сильный трек помогает, но без повторяемой системы внимания "
+            "он обычно тонет в рекомендациях быстрее, чем chairOS успевает заскрипеть колёсиками"
+        )
+        service, provider = self.service(CountingProvider(answer))
+        with self.assertLogs("learning.service", level="INFO") as logs:
+            result = service.maybe_direct_reply(
+                message("так и как по итогу прославиться в рэпе, стул?"),
+                explicit_address=True,
+            )
+        self.assertEqual(result, answer)
+        self.assertEqual(len(provider.calls), 1)
+        decision = service._last_direct_decision[-1]
+        self.assertEqual(decision.intent, "substantive")
+        self.assertEqual(decision.priority, "P3")
+        self.assertEqual(decision.producer, "grok")
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn("DIRECT_ROUTE", rendered_logs)
+        self.assertIn("intent=how_to", rendered_logs)
+        self.assertIn("LLM_RESULT", rendered_logs)
+        self.assertIn("accepted=true", rendered_logs)
+        self.assertNotIn("дай предмет", result)
+
+    def test_how_to_provider_failure_is_graceful_not_a_phantom_clarification(self):
+        service, provider = self.service(CountingProvider(None))
+        result = service.maybe_direct_reply(
+            message("стул как прославиться в рэпе"), explicit_address=True,
+        )
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn("вопрос", result)
+        self.assertNotIn("дай предмет", result)
+        self.assertNotIn("уточни", result)
+
+    def test_normal_useful_answer_is_not_a_provider_refusal(self):
+        service, provider = self.service(CountingProvider(
+            "сделай пять треков с узнаваемой подачей, режь из них сниппеты и регулярно выпускай лучшее"
+        ))
+        result = service.maybe_direct_reply(
+            message("стул как прославиться в рэпе"), explicit_address=True,
+        )
+        self.assertEqual(result, provider.result)
+
     def test_reply_to_chair_is_always_answered(self):
         service, provider = self.service()
         result = service.maybe_direct_reply(

@@ -30,6 +30,7 @@ from .pending_conversation import (
     extract_clarification,
     looks_like_continuation,
     pending_mode,
+    question_intent,
     is_ambiguous_choice_request,
     choice_declined,
     extract_choice_alternatives,
@@ -370,6 +371,12 @@ class LearningService:
 
     def _valid(self, text, input_text=None, source_texts=(), chat_id=None,
                max_words=None):
+        return self._validation_result(
+            text, input_text, source_texts, chat_id, max_words
+        )[0]
+
+    def _validation_result(self, text, input_text=None, source_texts=(), chat_id=None,
+                           max_words=None):
         previous = []
         if chat_id is not None:
             since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -378,7 +385,7 @@ class LearningService:
             text, source_texts, input_text, previous,
             self.settings.min_generated_words,
             max_words or self.settings.max_generated_words + 8,
-        )[0]
+        )
 
     def _chair_call_meta_joke_on_cooldown(self, chat_id, text):
         if not CHAIR_CALL_META_JOKE_RE.search(text or ""):
@@ -527,26 +534,42 @@ class LearningService:
                 getattr(chat_state, "conversation_type", None),
             )["stable_chat_memory"],
         )
+        provider_name = "injected" if self._injected_provider is not None else self.llm_provider_name(chat_id)
         result = self.provider_for_chat(chat_id).generate(selection.request)
-        max_words = 70 if purpose == "voice_story" else 18 if purpose == "creator" else 45
+        # Useful direct answers commonly need more than the old 45-word cap;
+        # the provider token limit and this 70-word ceiling still keep them brief.
+        max_words = 70 if purpose in {"voice_story", "reply", "question"} else 18 if purpose == "creator" else 45
+        if not result:
+            log.info(
+                "LLM_RESULT chat_id=%s provider=%s success=false accepted=false "
+                "fallback_reason=provider_empty_or_error producer_after_fallback=local",
+                chat_id, provider_name,
+            )
+            return None
         if purpose == "creator" and result:
             opening = normalize_spaces(result).casefold()
             if opening.startswith(("харакири", "создатель", "опять")):
                 log.info("Creator reply blocked because of a repetitive opening chat=%s", chat_id)
+                log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=creator_repetitive_opening producer_after_fallback=local", chat_id, provider_name)
                 return None
         if result and self._chair_call_meta_joke_on_cooldown(chat_id, result):
             log.info("Repeated chair-call meta joke blocked chat=%s", chat_id)
+            log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=chair_call_cooldown producer_after_fallback=local", chat_id, provider_name)
             return None
         if result and looks_like_provider_refusal(result):
             log.info("Provider refusal routed to local fallback chat=%s", chat_id)
+            log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=provider_refusal producer_after_fallback=local", chat_id, provider_name)
             return None
-        if result and self._valid(result, context, chat_id=chat_id, max_words=max_words):
+        accepted, validation_reason = self._validation_result(
+            result, context, chat_id=chat_id, max_words=max_words,
+        )
+        if accepted:
             self.persona.record_usage(
                 chat_id, selection.meme_ids, selection.cooldown_groups
             )
+            log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=true fallback_reason=none", chat_id, provider_name)
             return result
-        if result:
-            log.info("OpenAI result blocked by filter chat=%s", chat_id)
+        log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=validation_reject validation_reject=%s producer_after_fallback=local", chat_id, provider_name, validation_reason)
         return None
 
     def generate_openai(
@@ -822,6 +845,15 @@ class LearningService:
             ai_available=ai_available,
             budget_exceeded=budget_exceeded,
             social_ai_useful=social_ai_useful,
+        )
+        detected_intent = (
+            question_intent(subject)
+            if route.intent == SUBSTANTIVE else route.intent
+        )
+        log.info(
+            "DIRECT_ROUTE chat_id=%s intent=%s substantive=%s priority=%s producer=%s reason=%s",
+            chat_id, detected_intent, route.intent == SUBSTANTIVE,
+            route.priority, route.producer, route.reason,
         )
         repository.record_routing_event(f"intent_{route.intent}")
         self._last_direct_decision[chat_id] = route

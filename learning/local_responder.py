@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from .direct_address import SOCIAL, SUBSTANTIVE
 from .preprocessing import normalize_spaces
-from .pending_conversation import is_ambiguous_choice_request
+from .pending_conversation import is_ambiguous_choice_request, question_intent, HOW_TO
 
 
 PROFANITY_RE = re.compile(
@@ -51,9 +51,13 @@ RESPONSES = {
         "chairOS ждёт конкретики", "принял, что дальше",
     ),
     "substantive_fallback": (
-        "вопрос по делу, но без модели лучше не галлюцинировать ответ из обивки",
-        "дай предмет и цель — chairOS разложит без фанфика",
-        "нужен конкретный контекст, иначе будет ответ уровня гадания на колёсиках",
+        "chairOS сейчас без внешнего мозга, но вопрос понял; повтори через минуту",
+        "внешний мозг отвалился, не буду выдумывать ответ из обивки; попробуй ещё раз через минуту",
+        "вопрос принят, но сейчас лучше повторить его через минуту, чем получить фанфик от колёсиков",
+    ),
+    "how_to_unavailable": (
+        "chairOS сейчас без больших мозгов, но вопрос понял; повтори через минуту",
+        "вопрос понятен, просто внешний мозг отвалился; попробуй ещё раз через минуту",
     ),
 }
 
@@ -108,6 +112,11 @@ class LocalResponder:
                     "между чем выбираешь, лил бро" if troll_mode else "между чем выбираете?",
                     (),
                 )
+            # This branch is only used after the preferred provider failed or
+            # was unavailable. Never pretend an already clear how-to lacks a
+            # subject or goal.
+            if question_intent(normalized) == HOW_TO:
+                category = "how_to_unavailable"
         variants = list(
             RESPONSES[category] if troll_mode else NEUTRAL_RESPONSES[intent]
         )

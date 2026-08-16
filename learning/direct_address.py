@@ -82,5 +82,5 @@ class DirectAddressRouter:
         # The soft budget protects low-value calls. P3 remains AI-preferred so a
         # useful question is never silently dropped merely because spend is high.
         producer = "grok" if ai_available else "local"
-        reason = "substantive_ai" if ai_available else "substantive_local_fallback"
+        reason = "substantive_direct" if ai_available else "substantive_local_fallback"
         return ResponseDecision(True, intent, "P3", producer, reason, direct_reply)
