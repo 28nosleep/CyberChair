@@ -1,0 +1,9 @@
+services:
+  cyberchair:
+    build: .
+    container_name: cyberchair
+    env_file:
+      - .env.example
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data

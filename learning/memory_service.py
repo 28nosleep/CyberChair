@@ -79,7 +79,9 @@ class MemoryService:
         for value in values or ():
             clean = normalize_spaces(str(value))[:200]
             value_terms = set(re.findall(r"[\wёЁ-]{4,}", clean.casefold()))
-            if clean and terms and value_terms & terms:
+            stems = {term[:3] for term in terms if len(term) >= 4}
+            value_stems = {term[:3] for term in value_terms if len(term) >= 4}
+            if clean and terms and (value_terms & terms or stems & value_stems):
                 result.append(clean)
             if len(result) >= limit:
                 break

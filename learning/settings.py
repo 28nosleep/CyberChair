@@ -61,6 +61,9 @@ class LearningSettings:
     active_chat_reply_chance: float = field(default_factory=lambda: _float("ACTIVE_CHAT_REPLY_CHANCE", 0.16))
     openai_random_reply_chance: float = field(default_factory=lambda: _float("OPENAI_RANDOM_REPLY_CHANCE", 0.12))
     reply_to_stul_chance: float = field(default_factory=lambda: _float("REPLY_TO_STUL_CHANCE", 0.40))
+    # Applied locally only to explicitly addressed substantive turns while
+    # TrollMode is enabled. Kept in config so it can later become per-chat UI.
+    troll_user_probability: float = field(default_factory=lambda: _float("TROLL_USER_PROBABILITY", 0.50))
     stul_markov_reply_chance: float = field(default_factory=lambda: _float("STUL_MARKOV_REPLY_CHANCE", 0.50))
     frequent_stul_markov_chance: float = field(default_factory=lambda: _float("FREQUENT_STUL_MARKOV_CHANCE", 0.80))
     # A bare invocation is much weaker than an addressed question. Keep this

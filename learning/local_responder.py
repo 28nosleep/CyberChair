@@ -77,6 +77,51 @@ class LocalResponder:
         self.lexicon = lexicon
         self.rng = rng
 
+    def _troll_user(self, text, repository, excluded_meme_ids, excluded_meme_groups):
+        """A real roast fallback: never turn provider failure into advice."""
+        normalized = normalize_spaces(text or "").casefold()
+        topic = next((label for pattern, label in (
+            (r"docker|nginx|dns|redis|vpn|wi.?fi|тест", "инфраструктуру"),
+            (r"деньг|накоп|кредит|банк|квартир", "кошелёк"),
+            (r"голов|температур|бессон|спин|врач|вес|бег", "биологический квест"),
+            (r"айфон|пиксел|android|ios|телефон|ssd|ноутбук|монитор|роутер|клавиатур|пк", "техношопинг"),
+            (r"паст|рис|кофе|готов", "кухню"),
+            (r"рэп|альбом|стрим|гитар|рисова", "творческую карьеру"),
+            (r"игр|elden", "твой квест"),
+            (r"работ|резюме|переговор|команд", "карьерную арку"),
+            (r"девушк|расстав", "романтический сериал"),
+            (r"кот|дом|переезд", "бытовой survival"),
+        ) if re.search(pattern, normalized)), "этот план")
+        callbacks = []
+        terms = set(re.findall(r"[а-яёa-z0-9]{4,}", normalized))
+        for item in repository.stable_memories(20):
+            value = normalize_spaces(str(item))
+            if terms & set(re.findall(r"[а-яёa-z0-9]{4,}", value.casefold())):
+                callbacks.append(value[:100])
+        if callbacks:
+            variants = [
+                f"вчерашний лор про «{callbacks[0]}» уже был намёком, а ты всё равно пришёл прокачивать {topic} как побочный квест",
+                f"chairOS сверил память: «{callbacks[0]}». похоже, {topic} у тебя не вопрос, а сезонная арка без финала",
+            ]
+        else:
+            variants = [
+                f"бро смотрит на {topic} так, будто финальный босс сам выдаст ему гайд после этой формулировки",
+                f"достижение разблокировано: спросить про {topic} с уверенностью человека, который уже проиграл туториал",
+                f"chairOS фиксирует: {topic} снова пытаются закрыть одним сообщением, как будто реальность подписана на премиум",
+                f"по постановке видно: {topic} у тебя уже не проблема, а франшиза с нулевым бюджетом",
+                f"это не вопрос про {topic}, это заявка на то, чтобы взрослый интернет сделал за тебя домашку",
+                f"у тебя с {topic} такой контакт, будто ты открыл меню настроек и сразу начал переговоры с богом",
+            ]
+        result = variants[min(len(variants) - 1, int(self.rng.random() * len(variants)))]
+        selected = self.lexicon.select(
+            text, {"mocking", "humor"}, .7, excluded_meme_ids,
+            excluded_meme_groups, limit=1, recent_concepts=excluded_meme_groups,
+        )
+        if selected and selected[0].output not in result and self.rng.random() < .35:
+            result = f"{result}, {selected[0].output}"
+            return result, (selected[0],)
+        return result, ()
+
     @staticmethod
     def _category(text, intent):
         normalized = normalize_spaces(text or "").casefold()
@@ -95,7 +140,10 @@ class LocalResponder:
         return "acknowledgement"
 
     def respond(self, chat_id, text, intent, repository, excluded_meme_ids=(),
-                excluded_meme_groups=(), troll_mode=True, troll_intensity=.6):
+                excluded_meme_groups=(), troll_mode=True, troll_intensity=.6,
+                behavior_mode="useful_answer"):
+        if intent == SUBSTANTIVE and behavior_mode == "troll_user":
+            return self._troll_user(text, repository, excluded_meme_ids, excluded_meme_groups)
         category = self._category(text, intent)
         normalized = normalize_spaces(text or "").casefold()
         if intent == SUBSTANTIVE:

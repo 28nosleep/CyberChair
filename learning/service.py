@@ -628,7 +628,8 @@ class LearningService:
         ).digest()
         return int.from_bytes(digest[:8], "big") / 2**64
 
-    def _record_direct_result(self, chat_id, message, producer, result):
+    def _record_direct_result(self, chat_id, message, producer, result,
+                              behavior_mode="useful_answer"):
         repository = self.repository(chat_id)
         route = result.action if isinstance(result, MediaDecision) else producer
         if route == "ai":
@@ -640,9 +641,16 @@ class LearningService:
             f"direct_{route}",
         )
         self._remember_policy_target(chat_id, message)
-        if isinstance(result, str):
+        if isinstance(result, str) and behavior_mode != "troll_user":
             self._store_pending_from_response(message, result, "substantive")
         return result
+
+    def _substantive_behavior_mode(self, chat_id):
+        """Choose once, locally, before selecting the single response producer."""
+        if not self.troll_mode(chat_id):
+            return "useful_answer"
+        probability = max(0.0, min(1.0, float(self.settings.troll_user_probability)))
+        return "troll_user" if self.rng.random() < probability else "useful_answer"
 
     def _store_pending_from_response(self, message, response, intent):
         clarification = extract_clarification(response)
@@ -850,10 +858,14 @@ class LearningService:
             question_intent(subject)
             if route.intent == SUBSTANTIVE else route.intent
         )
+        behavior_mode = (
+            self._substantive_behavior_mode(chat_id)
+            if route.intent == SUBSTANTIVE else "chat"
+        )
         log.info(
-            "DIRECT_ROUTE chat_id=%s intent=%s substantive=%s priority=%s producer=%s reason=%s",
+            "DIRECT_ROUTE chat_id=%s intent=%s substantive=%s mode=%s priority=%s producer=%s reason=%s",
             chat_id, detected_intent, route.intent == SUBSTANTIVE,
-            route.priority, route.producer, route.reason,
+            behavior_mode, route.priority, route.producer, route.reason,
         )
         repository.record_routing_event(f"intent_{route.intent}")
         self._last_direct_decision[chat_id] = route
@@ -905,11 +917,14 @@ class LearningService:
         with self._response_activity(chat_id, "typing", selected_producer) as action:
             if route.producer == "grok":
                 result = self.generate_openai(
-                    chat_id, self._message_context(message), "reply",
+                    chat_id, self._message_context(message),
+                    "troll_user" if behavior_mode == "troll_user" else "reply",
                     conversation_decision=conversation, chat_state=state,
                 )
                 if result:
-                    return self._record_direct_result(chat_id, message, "grok", result)
+                    return self._record_direct_result(
+                        chat_id, message, "grok", result, behavior_mode
+                    )
                 repository.record_routing_event("grok_fallback_local")
 
             # Markov is an occasional SOCIAL producer and is selected before
@@ -925,6 +940,7 @@ class LearningService:
                 self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
                 self.troll_mode(chat_id),
                 conversation.troll_intensity,
+                behavior_mode,
             )
             if memes:
                 self.persona.record_usage(
@@ -933,7 +949,9 @@ class LearningService:
                     tuple(item.cooldown_group for item in memes),
                 )
             self._ensure_action_visible(action, "local", result)
-            return self._record_direct_result(chat_id, message, "local", result)
+            return self._record_direct_result(
+                chat_id, message, "local", result, behavior_mode
+            )
 
     def maybe_reply(self, message, bot_id=None, bot_username=None):
         chat_id = message.chat.id

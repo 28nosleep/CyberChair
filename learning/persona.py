@@ -96,6 +96,7 @@ class PersonaBuilder:
             ),
             "reply": "Ответь участнику по смыслу сообщения, не цитируя и не пересказывая его фразу. Режим useful_answer: сначала конкретная практическая информация, затем уместный характерный стёб; ругань не должна заменять информацию, но полезность не отключает разрешённый мат и persona CyberChair.",
             "question": "Режим useful_answer: коротко и конкретно ответь на вопрос, обращённый к Стулу: полезная информация обязательна, persona, естественный мат по troll_intensity и стёб — поверх неё, а не вместо неё. Не цитируй и не пересказывай вопрос.",
+            "troll_user": "Режим troll_user: вопрос понят, но дай законченный контекстный roast именно пользователя, его ситуации, амбиций или постановки вопроса. Никаких инструкций, советов, фактов, списков, уточняющих вопросов, отказов и фраз «если серьёзно». Это не fake guide: только панчлайн/наблюдение. Сначала опирайся на текущий вопрос, затем на недавний контекст, релевантные callbacks и stable memory; не выдумывай прошлые события. Меняй структуру: deadpan, абсурдное сравнение, hyperbole, mock achievement, псевдо-диагностика или редкий chairOS flavour. 0–2 мем-концепта, ноль нормально.",
             "random_reply": "Уместно вклинись в текущий разговор короткой репликой.",
             "stul_cooldown": "На повторное упоминание стула ответь как проснувшийся CyberChair, без статистики времени.",
             "creator": (
@@ -122,7 +123,12 @@ class PersonaBuilder:
             if not value or any(memories_are_similar(value, old) for old in unique):
                 continue
             value_terms = set(significant_words(value))
-            if value_terms & terms:
+            # Russian inflection should not make a real callback invisible:
+            # "игру" must still find a stored "игры" event. A short stem
+            # stem is only a relevance hint, never permission to invent memory.
+            stems = {word[:3] for word in terms if len(word) >= 4}
+            value_stems = {word[:3] for word in value_terms if len(word) >= 4}
+            if value_terms & terms or stems & value_stems:
                 unique.append(value)
         return tuple(unique[:2])
 
@@ -202,7 +208,10 @@ class PersonaBuilder:
         metadata = {
             "chat_id": chat_id,
             "purpose": purpose,
-            "behavior_mode": "useful_answer" if purpose in {"question", "reply"} else "chat",
+            "behavior_mode": (
+                "troll_user" if purpose == "troll_user"
+                else "useful_answer" if purpose in {"question", "reply"} else "chat"
+            ),
             "call_type": (
                 "autonomous" if purpose == "autonomous"
                 else "meme" if purpose == "meme_caption"
