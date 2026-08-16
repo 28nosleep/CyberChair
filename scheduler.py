@@ -1,5 +1,6 @@
 import random
 import time
+from collections import deque
 from datetime import timedelta
 
 from messages import (
@@ -25,6 +26,7 @@ _last_event = None
 _last_quote = None
 _last_quote_event = None
 _next_random_at = None
+_recent_quotes = deque(maxlen=7)
 
 
 def random_without_repeat(items, previous):
@@ -113,8 +115,16 @@ def daily_quote_minutes(current, count=2):
 
 def movie_quote_message(bot, chat_id):
     global _last_quote
-    _last_quote = random_without_repeat(MOVIE_QUOTES, _last_quote)
+    candidates = [quote for quote in MOVIE_QUOTES if quote not in _recent_quotes]
+    _last_quote = random.choice(candidates or MOVIE_QUOTES)
+    _recent_quotes.append(_last_quote)
     bot.send_message(chat_id, format_movie_quote(_last_quote), parse_mode="HTML")
+
+
+def daily_freekucher_minute(current):
+    """Stable pseudo-random publication minute between 11:00 and 21:59."""
+    daily_random = random.Random(f"freekucher:{current.date().isoformat()}")
+    return daily_random.randrange(11 * 60, 22 * 60)
 
 
 def _claim_event(callback, chat_id, event_key):
@@ -135,6 +145,7 @@ def scheduler(
     activity_percent_provider=None,
     event_claim_callback=None,
     autonomous_sender=None,
+    daily_freekucher_callback=None,
 ):
     global _last_event
     global _last_quote_event
@@ -144,6 +155,14 @@ def scheduler(
         try:
             current = get_now(timezone)
             current_minutes = current.hour * 60 + current.minute
+
+            freekucher_event = f"freekucher:{current.date().isoformat()}"
+            if (
+                daily_freekucher_callback
+                and current_minutes >= daily_freekucher_minute(current)
+                and _claim_event(event_claim_callback, chat_id, freekucher_event)
+            ):
+                daily_freekucher_callback(chat_id)
 
             quote_minutes = current_minutes
             quote_cycle_date = current.date()

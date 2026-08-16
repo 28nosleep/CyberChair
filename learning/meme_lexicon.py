@@ -1,3 +1,4 @@
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -23,10 +24,10 @@ class MemeEntry:
         return any(f" {_normalized(alias)} " in haystack for alias in self.aliases)
 
 
-def _entry(identifier, output, aliases, meaning, contexts, intensity=0.4, group=None):
+def _entry(identifier, output, aliases, meaning, contexts, intensity=0.4, group=None, weight=1.0):
     return MemeEntry(
         identifier, output, tuple(dict.fromkeys((output, *aliases))), meaning,
-        tuple(contexts), intensity, 1.0, group or identifier,
+        tuple(contexts), intensity, weight, group or identifier,
     )
 
 
@@ -70,7 +71,13 @@ class MemeLexicon:
             overlap = len(set(entry.contexts) & signal_contexts)
             if not explicit and not overlap:
                 continue
-            scored.append((10 if explicit else 0, overlap, entry.weight, entry.id, entry))
+            # Stable per-message tie-breaking removes the old lexicographic
+            # hidden priority while keeping selection deterministic.
+            diversity = int.from_bytes(
+                hashlib.sha256(f"{normalized}:{entry.id}".encode("utf-8")).digest()[:4],
+                "big",
+            ) / 2**32
+            scored.append((10 if explicit else 0, overlap, entry.weight, diversity, entry))
         scored.sort(reverse=True)
         return [item[-1] for item in scored[: max(0, int(limit))]]
 
@@ -95,7 +102,7 @@ DEFAULT_ENTRIES = (
     _entry("let_him_cook", "дай ему готовить", ("let him cook", "let him cooke"), "постиронически дать идее развиться", ("humor", "praise"), .4),
     _entry("locked_in", "локед ин", ("locked in",), "кто-то чрезмерно сосредоточен", ("focus", "work", "humor"), .35),
     _entry("aura", "аура", ("aura",), "иронический социальный статус", ("humor", "mocking"), .4),
-    _entry("aura_loss", "минус аура", ("aura loss", "loss of aura"), "комический социальный провал", ("failure", "mocking"), .45, "aura"),
+    _entry("aura_loss", "минус аура", ("aura loss", "loss of aura"), "комический социальный провал", ("failure", "mocking"), .45, "aura", .35),
     _entry("mogging", "моггинг", ("mogging", "mog"), "демонстративное превосходство", ("mocking", "humor"), .55),
     _entry("mog", "мог", (), "краткое описание превосходства в сравнении", ("mocking", "humor"), .55, "mogging"),
     _entry("glazing", "глейзинг", ("glazing",), "чрезмерная похвала кому-то", ("praise", "mocking"), .5),

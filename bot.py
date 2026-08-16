@@ -276,7 +276,7 @@ def is_freekucher_message(text):
 
     return bool(
         text
-        and re.search(r"кучер|douxross", text, re.IGNORECASE)
+        and re.search(r"(?<!\w)(?:#?freekucher|kucher|кучер|douxross)(?!\w)", text, re.IGNORECASE)
     )
 
 
@@ -297,6 +297,11 @@ def freekucher_reaction(message):
     bot.reply_to(message, "#FREEKUCHER")
 
     return True
+
+
+def send_daily_freekucher(chat_id):
+    """Scheduler-only daily action; it never invokes the LLM."""
+    bot.send_message(chat_id, "#FREEKUCHER")
 
 
 def chair_remaining_message():
@@ -1193,6 +1198,7 @@ def main():
             learning_service.activity_percent,
             learning_service.claim_scheduled_event,
             send_autonomous_response,
+            send_daily_freekucher,
         ),
         daemon=True,
     ).start()

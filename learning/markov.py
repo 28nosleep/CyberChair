@@ -12,8 +12,10 @@ class MarkovModel:
     def train(self, texts):
         self.transitions.clear()
         self.starts.clear()
-        for text in texts:
-            self.add(text)
+        for item in texts:
+            text, weight = item if isinstance(item, tuple) else (item, 1)
+            for _ in range(max(1, int(weight))):
+                self.add(text)
         return self
 
     def add(self, text):

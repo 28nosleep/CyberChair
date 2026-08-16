@@ -281,15 +281,44 @@ class LearningService:
                 model = self._models.pop(chat_id)
                 self._models[chat_id] = model
             else:
-                messages = repository.recent_messages()
-                model = MarkovModel().train([row["text"] for row in messages])
+                messages = self._markov_corpus(repository)
+                model = MarkovModel().train([
+                    (row["text"], row["generation_weight"])
+                    for row in messages
+                ])
                 self._models[chat_id] = model
                 self._model_counts[chat_id] = count
                 while len(self._models) > self.settings.model_cache_size:
                     old_chat, _ = self._models.popitem(last=False)
                     self._model_counts.pop(old_chat, None)
-            messages = repository.recent_messages()
+            messages = self._markov_corpus(repository)
         return model, messages
+
+    def _markov_corpus(self, repository, current=None):
+        """Build an age-tiered corpus without the live edge of the chat."""
+        rows = repository.meme_source_messages()
+        excluded = max(1, int(self.settings.markov_exclude_recent_messages))
+        rows = rows[:-excluded] if len(rows) > excluded else []
+        now = current or datetime.now(timezone.utc)
+        eligible = []
+        for row in rows:
+            created = self._as_utc(row.get("created_at"))
+            if created and (now - created).total_seconds() < self.settings.markov_min_message_age_seconds:
+                continue
+            eligible.append(dict(row))
+
+        recent_size = max(0, int(self.settings.markov_recent_history_size))
+        old_boundary = max(0, len(eligible) - recent_size)
+        for index, row in enumerate(eligible):
+            # Older language is the base corpus. Replied-to/local-meme-like rows
+            # get an extra vote; recently used sources lose that advantage.
+            weight = 3 if index < old_boundary else 1
+            if row.get("reply_count") or row.get("is_reply"):
+                weight += 2
+            if row.get("last_used_at"):
+                weight = max(1, weight - 2)
+            row["generation_weight"] = weight
+        return eligible
 
     def _valid(self, text, input_text=None, source_texts=(), chat_id=None,
                max_words=None):
@@ -585,6 +614,11 @@ class LearningService:
                     getattr(message, "message_id", getattr(message, "id", 0)),
                     "meme",
                 ),
+                reaction_roll=self._deterministic_media_roll(
+                    chat_id,
+                    getattr(message, "message_id", getattr(message, "id", 0)),
+                    "reaction",
+                ),
             )
         if media_decision.action != "none":
             self.triggers.commit(chat_id, kind)
@@ -594,6 +628,10 @@ class LearningService:
                 "contextual_media",
             )
             self._remember_policy_target(chat_id, message)
+            log.info(
+                "Delivery selected chat=%s event=reply action=%s reason=%s",
+                chat_id, media_decision.action, media_decision.reason,
+            )
             return media_decision
         # Addressed replies use the selected provider. Ordinary random replies
         # may still use the existing local generator.
@@ -606,7 +644,7 @@ class LearningService:
                 conversation_decision=decision,
                 chat_state=state,
             )
-            provider = "openai"
+            provider = "ai"
         else:
             result = self.generate_local(chat_id, text)
             provider = "markov"
@@ -615,7 +653,7 @@ class LearningService:
             self.repository(chat_id).record_generated(result, kind)
             self._remember_policy_target(chat_id, message)
             log.info(
-                "Generated reply ready chat=%s trigger=%s provider=%s",
+                "Generated reply ready chat=%s trigger=%s generation_path=%s delivery=text",
                 chat_id,
                 kind,
                 provider,
@@ -659,12 +697,12 @@ class LearningService:
                 self._message_context(message),
                 "reply",
             )
-            provider = "openai"
+            provider = "ai"
             if result:
                 self.triggers.commit(chat_id, "stul_cooldown")
                 self.repository(chat_id).record_generated(result, "stul_cooldown")
                 log.info(
-                    "Contextual chair call answered chat=%s provider=%s",
+                    "Contextual chair call answered chat=%s generation_path=%s delivery=text",
                     chat_id,
                     provider,
                 )
@@ -672,24 +710,39 @@ class LearningService:
 
         frequency = self.triggers.note_chair(chat_id)
         roll = self.rng.random()
-        ai_threshold = self.settings.reply_to_stul_chance
-        markov_threshold = ai_threshold + self.settings.stul_markov_reply_chance
+        ai_chance = self.settings.reply_to_stul_chance
+        markov_chance = self.settings.stul_markov_reply_chance
+        invocation = normalize_spaces(message.text).casefold().strip(".,!?…")
+        is_bare_invocation = invocation in {"стул", "стульчик"}
+        factor = self.settings.bare_stul_reply_factor if is_bare_invocation else 1.0
+        total = min(1.0, (ai_chance + markov_chance) * factor)
+        if roll >= total:
+            return None
 
-        if frequency >= 2 and roll < self.settings.frequent_stul_markov_chance:
-            result = self.generate_local(chat_id, message.text)
-            provider = "markov"
-        elif roll < ai_threshold:
+        provider_roll = roll / total if total else 1.0
+        if frequency >= 2:
+            provider = (
+                "markov"
+                if provider_roll < self.settings.frequent_stul_markov_chance
+                else "ai"
+            )
+        elif is_bare_invocation:
+            # When a rare bare call is accepted, prefer the coherent path; the
+            # occurrence probability itself is already sharply reduced.
+            provider = "ai" if provider_roll < .8 else "markov"
+        else:
+            provider = "ai" if provider_roll < ai_chance / (ai_chance + markov_chance) else "markov"
+
+        if provider == "ai":
             result = self.generate_openai(
                 chat_id,
                 self._message_context(message),
                 "stul_cooldown",
             )
-            provider = "openai"
-        elif roll < markov_threshold:
+            provider = "ai"
+        else:
             result = self.generate_local(chat_id, message.text)
             provider = "markov"
-        else:
-            return None
 
         if result:
             if self._chair_call_meta_joke_on_cooldown(chat_id, result):
@@ -698,7 +751,7 @@ class LearningService:
             self.triggers.commit(chat_id, "stul_cooldown")
             self.repository(chat_id).record_generated(result, "stul_cooldown")
             log.info(
-                "Repeated chair trigger answered chat=%s provider=%s",
+                "Repeated chair trigger answered chat=%s generation_path=%s delivery=text",
                 chat_id,
                 provider,
             )
@@ -889,6 +942,10 @@ class LearningService:
             repository.record_generated(
                 media.template_id or media.asset_id or "media", "autonomous_media", utc_current
             )
+            log.info(
+                "Delivery selected chat=%s event=autonomous action=%s reason=%s",
+                chat_id, media.action, media.reason,
+            )
             return media
         if not self.provider_available(chat_id):
             return None
@@ -899,6 +956,10 @@ class LearningService:
             return None
         self.triggers.commit(chat_id, "autonomous")
         repository.record_generated(result, "autonomous", utc_current)
+        log.info(
+            "Generated reply ready chat=%s trigger=autonomous generation_path=ai delivery=text",
+            chat_id,
+        )
         return result
 
     def _quiet_hours_at(self, current):
@@ -1041,7 +1102,10 @@ class LearningService:
         if ai_ready:
             context = source.text or None
             caption = self.generate_openai(chat_id, context, "meme_caption")
-        if not caption:
+            # An event that selected AI never cascades into Markov/local output.
+            if not caption:
+                return None
+        else:
             source, caption = self._local_command_caption(chat_id, source, rows, callbacks)
         if not caption:
             return None
@@ -1064,18 +1128,12 @@ class LearningService:
         return decision
 
     def _local_command_caption(self, chat_id, source, rows, callbacks):
-        """Local cascade: real old quote → fresh → callback → rare Markov → phrase."""
+        """One ready local fallback; it never chains into another producer."""
         if source.kind in {"old", "fresh", "callback"} and source.text:
             return source, self._caption_from_source(source)
-        if self.meme_sources.markov_allowed(chat_id):
-            brainrot = self.generate_local(chat_id, None)
-            if brainrot:
-                return MemeSource("markov", brainrot), self._caption_from_source(
-                    MemeSource("markov", brainrot)
-                )
         phrases = (
             "chairOS фиксирует промышленный скилл ишью",
-            "минус аура, протокол брейнрота активирован",
+            "протокол брейнрота активирован, проект кукд",
             "лил бро выбрал сайдквест вместо жизни",
             "сканирование завершено: проект кукд",
         )
@@ -1089,7 +1147,7 @@ class LearningService:
         if source.kind == "markov":
             return f"{text} — пошёл брейнрот"
         tails = (
-            "минус аура зафиксирована",
+            "канон ивент зафиксирован",
             "лил бро ларпит сигму",
             "chairOS фиксирует скилл ишью",
             "сойджак-комиссия уже выехала",

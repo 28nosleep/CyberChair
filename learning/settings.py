@@ -63,6 +63,9 @@ class LearningSettings:
     reply_to_stul_chance: float = field(default_factory=lambda: _float("REPLY_TO_STUL_CHANCE", 0.40))
     stul_markov_reply_chance: float = field(default_factory=lambda: _float("STUL_MARKOV_REPLY_CHANCE", 0.50))
     frequent_stul_markov_chance: float = field(default_factory=lambda: _float("FREQUENT_STUL_MARKOV_CHANCE", 0.80))
+    # A bare invocation is much weaker than an addressed question. Keep this
+    # separate from the global activity and addressed-reply controls.
+    bare_stul_reply_factor: float = field(default_factory=lambda: _float("BARE_STUL_REPLY_FACTOR", 0.35))
     creator_username: str = field(default_factory=lambda: os.getenv("CREATOR_USERNAME", "sssssssssssssss28").strip().lstrip("@").casefold())
     sglypa_reply_chance: float = field(default_factory=lambda: _float("SGLYPA_REPLY_CHANCE", 0.375))
     trigger_reaction_chance: float = field(default_factory=lambda: _float("TRIGGER_REACTION_CHANCE", 0.08))
@@ -88,6 +91,9 @@ class LearningSettings:
     summary_time_interval: int = field(default_factory=lambda: _int("SUMMARY_TIME_INTERVAL", 1200))
     max_long_memories: int = field(default_factory=lambda: _int("MAX_LONG_MEMORIES", 40))
     model_cache_size: int = field(default_factory=lambda: _int("MODEL_CACHE_SIZE", 20))
+    markov_exclude_recent_messages: int = field(default_factory=lambda: _int("MARKOV_EXCLUDE_RECENT_MESSAGES", 3))
+    markov_min_message_age_seconds: int = field(default_factory=lambda: _int("MARKOV_MIN_MESSAGE_AGE_SECONDS", 120))
+    markov_recent_history_size: int = field(default_factory=lambda: _int("MARKOV_RECENT_HISTORY_SIZE", 10))
     max_stored_text_length: int = field(default_factory=lambda: _int("MAX_STORED_TEXT_LENGTH", 2000))
     allow_user_mentions: bool = field(default_factory=lambda: _bool("ALLOW_USER_MENTIONS", False))
     quiet_start_hour: int = field(default_factory=lambda: _int("QUIET_START_HOUR", 23))
@@ -142,6 +148,7 @@ class LearningSettings:
     media_humor_bonus: float = field(default_factory=lambda: _float("MEDIA_HUMOR_BONUS", 0.14))
     media_argument_bonus: float = field(default_factory=lambda: _float("MEDIA_ARGUMENT_BONUS", 0.08))
     media_meme_chance: float = field(default_factory=lambda: _float("MEDIA_MEME_CHANCE", 0.55))
+    media_gif_share: float = field(default_factory=lambda: _float("MEDIA_GIF_SHARE", 0.72))
     media_cooldown: int = field(default_factory=lambda: _int("MEDIA_COOLDOWN", 600))
     meme_render_cooldown: int = field(default_factory=lambda: _int("MEME_RENDER_COOLDOWN", 1800))
     media_template_cooldown: int = field(default_factory=lambda: _int("MEDIA_TEMPLATE_COOLDOWN", 3600))

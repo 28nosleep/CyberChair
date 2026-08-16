@@ -147,19 +147,51 @@ class MediaService:
                     continue
                 overlap = len(set(row["tags"]) & signals)
                 if overlap:
-                    scored.append((overlap, row.get("last_used_at") or "", key, kind, row))
+                    # Equal contextual matches used to prefer "sticker" only
+                    # because it sorts after "gif" lexicographically.
+                    kind_bias = 1 if kind == "gif" else 0
+                    scored.append((overlap, kind_bias, row.get("last_used_at") is None, key, kind, row))
         if not scored:
             return None
-        _, _, key, kind, row = sorted(scored, reverse=True)[0]
+        _, _, _, key, kind, row = sorted(scored, reverse=True)[0]
         return MediaDecision(
             action=kind, asset_id=row["file_id"], confidence=.65,
             reason=f"contextual_{kind}",
             asset_key=key, cooldown_group=f"{kind}_reaction", archetype=kind,
         ), key, f"{kind}_reaction"
 
+    def _contextual_pool_reaction(self, repository, state, text, recent, roll):
+        """Use learned untagged reactions only in clearly informal contexts."""
+        if state.conversation_type not in {"humor", "argument"}:
+            return None
+        if len(normalize_memory(text).split()) < 2:
+            return None
+        gif_share = max(0.0, min(1.0, self.settings.media_gif_share))
+        first = "gif" if roll < gif_share else "sticker"
+        order = (first, "sticker" if first == "gif" else "gif")
+        recent_assets = {row["asset_key"] for row in recent}
+        for kind in order:
+            if kind == "gif" and not self.settings.gif_enabled:
+                continue
+            if kind == "sticker" and not self.settings.sticker_enabled:
+                continue
+            row = repository.random_gif() if kind == "gif" else repository.random_sticker()
+            if not row:
+                continue
+            key = f"{kind}:{row['file_unique_id']}"
+            if key in recent_assets:
+                continue
+            return MediaDecision(
+                action=kind, asset_id=row["file_id"], confidence=.38,
+                reason=f"contextual_{kind}_pool", asset_key=key,
+                cooldown_group=f"{kind}_reaction", archetype=kind,
+            )
+        return None
+
     def decide(self, chat_id, repository, conversation_decision, chat_state,
                short_term_rows, target_text=None, selected_memes=(), local_callbacks=(),
-               troll_mode=True, probability_roll=None, meme_roll=None):
+               troll_mode=True, probability_roll=None, meme_roll=None,
+               reaction_roll=None):
         if not troll_mode:
             return self.none("troll_mode_off")
         if conversation_decision.action == "none":
@@ -204,6 +236,12 @@ class MediaService:
         )
         if reaction:
             return reaction[0]
+        pool_roll = self.rng.random() if reaction_roll is None else reaction_roll
+        reaction = self._contextual_pool_reaction(
+            repository, chat_state, text, recent, pool_roll
+        )
+        if reaction:
+            return reaction
         return self.none("no_contextual_asset")
 
     def commit(self, repository, decision):

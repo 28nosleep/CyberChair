@@ -33,7 +33,16 @@ class LocalGenerator:
         return " ".join(words)
 
     def create(self, model, messages, input_text=None, previous_bot_texts=()):
-        texts = [row["text"] if isinstance(row, dict) else row for row in messages]
+        source_texts = [row["text"] if isinstance(row, dict) else row for row in messages]
+        texts = (
+            [
+                text
+                for row, text in zip(messages, source_texts)
+                for _ in range(max(1, int(row.get("generation_weight", 1))))
+            ]
+            if messages and isinstance(messages[0], dict)
+            else source_texts
+        )
         context = significant_words(input_text or "")
         for _ in range(10):
             mode = self._mode()
@@ -56,7 +65,7 @@ class LocalGenerator:
             result = strip_mentions(result) if not self.settings.allow_user_mentions else result
             result = re.sub(r"\s+", " ", result).strip()
             ok, _ = validate_generated(
-                result, texts, input_text, previous_bot_texts,
+                result, source_texts, input_text, previous_bot_texts,
                 self.settings.min_generated_words,
                 self.settings.max_generated_words,
             )
