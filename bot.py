@@ -1,11 +1,15 @@
 import json
+import atexit
 import logging
 import os
 import random
 import re
+import signal
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
+from functools import wraps
 from html import escape
 from pathlib import Path
 
@@ -39,12 +43,24 @@ from messages import (
 
 from learning import (
     ChatActionManager,
+    DeliveryReceipt,
+    DeliveryType,
     LearningService,
     LearningSettings,
     MEDIA_CHAT_ACTIONS,
     MediaDecision,
+    Producer,
+    ResponsePlan,
 )
 from learning.preprocessing import FOREIGN_BOT_COMMAND_RE, VOICE_STORY_COMMAND_RE
+from learning.response_plan import GeneratedCommit, SourceUsageCommit
+from learning.event_context import current_event_id
+from learning.normalized_event import (
+    NormalizedEvent,
+    normalize_callback_event,
+    normalize_telegram_event,
+)
+from runtime_shutdown import ShutdownCoordinator
 
 # ==========================================
 # НАСТРОЙКИ
@@ -67,10 +83,194 @@ learning_settings = LearningSettings()
 learning_service = LearningService(learning_settings)
 chat_action_manager = ChatActionManager(bot)
 learning_service.response_activity = chat_action_manager.activity
+_runtime_shutdown_coordinator = None
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+
+@contextmanager
+def runtime_work(kind):
+    """Track one top-level runtime lifecycle without entering domain code."""
+    coordinator = _runtime_shutdown_coordinator
+    if coordinator is None:
+        yield True
+        return
+    with coordinator.work(kind) as admitted:
+        yield admitted
+
+
+def _shutdown_diagnostics():
+    report = learning_service.concurrency.snapshot()
+    report["typing_refreshers"] = chat_action_manager.worker_count()
+    return report
+
+
+def _atexit_shutdown():
+    coordinator = _runtime_shutdown_coordinator
+    if coordinator is not None:
+        coordinator.request_shutdown("atexit")
+        coordinator.drain("atexit")
+
+
+def _stop_telebot_workers(_deadline):
+    """Non-blocking final stop for TeleBot's daemon worker pool."""
+    pool = getattr(bot, "worker_pool", None)
+    for worker in tuple(getattr(pool, "workers", ()) or ()):
+        worker.stop()
+
+
+atexit.register(_atexit_shutdown)
+
+
+def telegram_user_event_handler(handler):
+    """Normalize once, then bind the existing R0 event context and permit."""
+    @wraps(handler)
+    def correlated(message, *args, **kwargs):
+        with runtime_work("foreground") as runtime_admission:
+            if not runtime_admission:
+                return None
+            event = normalize_telegram_event(message)
+            with learning_service.chat_event_slot(event) as admission:
+                if not admission:
+                    return None
+                with learning_service.telegram_user_event(event):
+                    return handler(message, event, *args, **kwargs)
+    return correlated
+
+
+def telegram_callback_event_handler(handler):
+    @wraps(handler)
+    def correlated(call, *args, **kwargs):
+        with runtime_work("foreground") as runtime_admission:
+            if not runtime_admission:
+                return None
+            event = normalize_callback_event(call)
+            with learning_service.chat_event_slot(event) as admission:
+                if not admission:
+                    return None
+                with learning_service.telegram_user_event(event):
+                    return handler(call, event, *args, **kwargs)
+    return correlated
+
+
+def log_delivery(chat_id, delivery_type, success, event_id=None):
+    logging.getLogger(__name__).info(
+        "DELIVERY event_id=%s chat_id=%s delivery_type=%s outcome=%s",
+        event_id or current_event_id(), chat_id, delivery_type,
+        "success" if success else "failure",
+    )
+
+
+def classify_delivery_error(error):
+    """Return a safe transport category without persisting exception text."""
+    name = type(error).__name__.casefold()
+    status = getattr(error, "error_code", None)
+    if "timeout" in name:
+        return "telegram_timeout"
+    if status == 429 or "too many requests" in name or "ratelimit" in name:
+        return "telegram_rate_limit"
+    if status == 403 or "forbidden" in name:
+        return "telegram_forbidden"
+    if status == 400 or "badrequest" in name or "bad_request" in name:
+        return "telegram_bad_request"
+    if any(part in name for part in ("connection", "network", "request")):
+        return "telegram_network"
+    return "unknown_transport"
+
+
+def deliver_response_plan(plan, message=None):
+    """The single Telegram transport boundary for one immutable final plan."""
+    try:
+        learning_service.record_delivery_attempt(plan)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "DELIVERY_ATTEMPT_TELEMETRY_FAILED event_id=%s", plan.event_id
+        )
+    rendered = None
+    try:
+        reply_to = plan.reply_to_message_id
+        if plan.delivery_type == DeliveryType.TEXT:
+            sent = (
+                bot.reply_to(message, plan.payload.text)
+                if message is not None
+                else bot.send_message(
+                    plan.chat_id,
+                    plan.payload.text,
+                    reply_to_message_id=reply_to,
+                )
+            )
+        elif plan.delivery_type == DeliveryType.ANIMATION:
+            sent = bot.send_animation(
+                plan.chat_id,
+                plan.payload.decision.asset_id,
+                reply_to_message_id=reply_to,
+            )
+        elif plan.delivery_type == DeliveryType.STICKER:
+            sent = bot.send_sticker(
+                plan.chat_id,
+                plan.payload.decision.asset_id,
+                reply_to_message_id=reply_to,
+            )
+        elif plan.delivery_type == DeliveryType.PHOTO:
+            path = plan.payload.prepared_path
+            if path is None:
+                rendered = learning_service.render_meme(
+                    plan.payload.decision,
+                    background=plan.purpose.startswith("autonomous"),
+                )
+                path = getattr(rendered, "path", None)
+            if path is None:
+                return DeliveryReceipt(
+                    plan.event_id, False, plan.delivery_type,
+                    error_category="renderer_failure",
+                )
+            with Path(path).open("rb") as image:
+                sent = bot.send_photo(
+                    plan.chat_id, image, reply_to_message_id=reply_to,
+                )
+        else:
+            return DeliveryReceipt(
+                plan.event_id, False, plan.delivery_type,
+                error_category="unsupported_delivery_type",
+            )
+        telegram_message_id = getattr(
+            sent, "message_id", getattr(sent, "id", None)
+        )
+        log_delivery(
+            plan.chat_id, plan.delivery_type.value, True, plan.event_id
+        )
+        return DeliveryReceipt(
+            plan.event_id, True, plan.delivery_type,
+            telegram_message_id=(
+                telegram_message_id
+                if isinstance(telegram_message_id, int) else None
+            ),
+        )
+    except Exception as error:
+        category = classify_delivery_error(error)
+        logging.getLogger(__name__).warning(
+            "Telegram delivery failed event_id=%s delivery_type=%s category=%s",
+            plan.event_id, plan.delivery_type.value, category,
+        )
+        log_delivery(
+            plan.chat_id, plan.delivery_type.value, False, plan.event_id
+        )
+        return DeliveryReceipt(
+            plan.event_id, False, plan.delivery_type,
+            error_category=category,
+        )
+    finally:
+        if rendered is not None:
+            learning_service.cleanup_rendered_meme(rendered)
+
+
+def execute_response_plan(plan, message=None):
+    """Deliver once, then commit or abort exactly that transport result."""
+    receipt = deliver_response_plan(plan, message)
+    learning_service.finalize_response(plan, receipt)
+    return receipt
 
 config_path = Path(__file__).with_name("config.txt")
 state_path = Path(__file__).with_name("bot_state.json")
@@ -252,9 +452,10 @@ load_state()
 # РЕАКЦИИ
 # ==========================================
 
-def reaction_text(message):
+def reaction_text(message, event=None):
 
-    text = message.text.lower()
+    event = event or normalize_telegram_event(message)
+    text = event.effective_text.lower()
 
     allowed_triggers = {"понедельник", "пятница", "кофе", "домой"}
 
@@ -266,7 +467,7 @@ def reaction_text(message):
         current_time = time.monotonic()
 
         with trigger_reply_lock:
-            last_reply = last_trigger_reply_at.get(message.chat.id)
+            last_reply = last_trigger_reply_at.get(event.chat_id)
             if (
                 last_reply is not None
                 and current_time - last_reply < learning_settings.trigger_reaction_cooldown
@@ -274,11 +475,18 @@ def reaction_text(message):
                 return False
             if random.random() >= learning_settings.trigger_reaction_chance:
                 return False
-            last_trigger_reply_at[message.chat.id] = current_time
+            # Short-lived collision reservation; a transport failure rolls it back.
+            last_trigger_reply_at[event.chat_id] = current_time
 
-        bot.reply_to(message, random.choice(REACTIONS[word]))
-
-        return True
+        plan = learning_service.prepare_text_response(
+            event, random.choice(REACTIONS[word]), "rare_trigger"
+        )
+        delivered = execute_response_plan(plan, message).success
+        if not delivered:
+            with trigger_reply_lock:
+                if last_trigger_reply_at.get(event.chat_id) == current_time:
+                    last_trigger_reply_at.pop(event.chat_id, None)
+        return delivered
 
     return False
 
@@ -291,28 +499,74 @@ def is_freekucher_message(text):
     )
 
 
-def freekucher_reaction(message):
+def freekucher_reaction(message, event=None):
 
-    if not is_freekucher_message(message.text):
+    event = event or normalize_telegram_event(message)
+    if not is_freekucher_message(event.effective_text):
         return False
-    if not learning_service.troll_mode(message.chat.id):
+    if not learning_service.troll_mode(event.chat_id):
         return False
 
     current_time = time.monotonic()
     with freekucher_reply_lock:
-        last_reply = last_freekucher_reply_at.get(message.chat.id)
+        last_reply = last_freekucher_reply_at.get(event.chat_id)
         if last_reply is not None and current_time - last_reply < FREEKUCHER_REPLY_COOLDOWN:
             return True
-        last_freekucher_reply_at[message.chat.id] = current_time
+        last_freekucher_reply_at[event.chat_id] = current_time
 
-    bot.reply_to(message, "#FREEKUCHER")
-
-    return True
+    plan = learning_service.prepare_text_response(
+        event, "#FREEKUCHER", "freekucher", required=True
+    )
+    delivered = execute_response_plan(plan, message).success
+    if not delivered:
+        with freekucher_reply_lock:
+            if last_freekucher_reply_at.get(event.chat_id) == current_time:
+                last_freekucher_reply_at.pop(event.chat_id, None)
+    return delivered
 
 
 def send_daily_freekucher(chat_id):
     """Scheduler-only daily action; it never invokes the LLM."""
     bot.send_message(chat_id, "#FREEKUCHER")
+
+
+def send_scheduled_text(event_id, chat_id, payload, parse_mode=None):
+    """P1 Telegram adapter; no foreground gate or conversation mutation."""
+    kwargs = {"parse_mode": parse_mode} if parse_mode else {}
+    try:
+        result = bot.send_message(chat_id, payload, **kwargs)
+    except Exception:
+        log_delivery(chat_id, "scheduled_text", False)
+        raise
+    log_delivery(chat_id, "scheduled_text", True)
+    return result
+
+
+def run_scheduled_notification(
+    chat_id, event_key, event_kind, scheduled_at, payload, parse_mode=None,
+):
+    with runtime_work("scheduled") as admission:
+        if not admission:
+            return None
+        return learning_service.deliver_scheduled_event(
+            chat_id,
+            event_key,
+            event_kind,
+            scheduled_at,
+            payload,
+            send_scheduled_text,
+            parse_mode=parse_mode,
+            current=get_now(TIMEZONE),
+        )
+
+
+def retry_scheduled_notifications(chat_id, current):
+    with runtime_work("scheduled") as admission:
+        if not admission:
+            return ()
+        return learning_service.deliver_pending_scheduled_events(
+            chat_id, send_scheduled_text, current=current, limit=10
+        )
 
 
 def chair_remaining_message():
@@ -338,19 +592,19 @@ def chair_remaining_message():
     return f"🪑 осталось стула: {format_time(hours, minutes)}"
 
 
-def is_sglypa_message(message):
-
-    user = message.from_user
-
+def is_sglypa_message(message_or_event):
+    event = (
+        message_or_event if isinstance(message_or_event, NormalizedEvent)
+        else normalize_telegram_event(message_or_event)
+    )
     return bool(
-        user
-        and user.is_bot
-        and user.username
-        and user.username.lower() == SGLYPA_USERNAME
+        event.user_is_bot
+        and event.username
+        and event.username.lower() == SGLYPA_USERNAME
     )
 
 
-def sglypa_reaction(message):
+def sglypa_reaction(message, event=None):
 
     global last_sglypa_reply_at
 
@@ -363,40 +617,53 @@ def sglypa_reaction(message):
         ):
             return False
 
-        reply = learning_service.maybe_sglypa_reply(message)
+        with learning_service.response_planning():
+            learning_service.context_snapshot(
+                event or normalize_telegram_event(message)
+            )
+            reply = learning_service.maybe_sglypa_reply(
+                event or normalize_telegram_event(message)
+            )
         if not reply:
             return False
+        # Temporary collision reservation; rolled back if Telegram rejects it.
         last_sglypa_reply_at = current_time
 
-    bot.reply_to(message, reply)
-
-    return True
+    delivered = send_contextual_response(
+        message, reply, event or normalize_telegram_event(message)
+    )
+    if not delivered:
+        with sglypa_reply_lock:
+            if last_sglypa_reply_at == current_time:
+                last_sglypa_reply_at = 0
+    return delivered
 
 
 # ==========================================
 # "К КТО"
 # ==========================================
 
-def remember_user(message):
-
-    user = message.from_user
-
-    if not user or user.is_bot:
+def remember_user(message_or_event):
+    event = (
+        message_or_event if isinstance(message_or_event, NormalizedEvent)
+        else normalize_telegram_event(message_or_event)
+    )
+    if event.user_id is None or event.user_is_bot:
         return
 
     user_data = {
-        "id": user.id,
-        "username": user.username,
-        "name": user.first_name or "пользователь",
+        "id": event.user_id,
+        "username": event.username,
+        "name": event.first_name or "пользователь",
     }
 
     with state_lock:
-        previous_user_data = bot_state["known_users"].get(user.id)
+        previous_user_data = bot_state["known_users"].get(event.user_id)
 
         if previous_user_data == user_data:
             return
 
-        bot_state["known_users"][user.id] = user_data
+        bot_state["known_users"][event.user_id] = user_data
         save_state()
 
 
@@ -517,44 +784,64 @@ def download_chat_image(file_id):
         return None
 
 
-def send_manual_meme(message, decision=None, hint=""):
-    with chat_action_manager.activity(
-        message.chat.id, MEDIA_CHAT_ACTIONS["meme"], "meme"
+def send_manual_meme(message, decision=None, hint="", event=None):
+    event = event or normalize_telegram_event(message)
+    with (
+        learning_service.response_planning(),
+        chat_action_manager.activity(
+            event.chat_id, MEDIA_CHAT_ACTIONS["meme"], "meme"
+        ),
     ):
+        learning_service.context_snapshot(event)
         if decision is None:
-            decision = learning_service.maybe_command_meme(message, hint)
+            decision = learning_service.maybe_command_meme(event, hint)
         if not decision:
             return False
         rendered = None
         source_path = None
         used_decision = decision
         try:
-            if decision.background_file_id:
-                source_path = download_chat_image(decision.background_file_id)
-                if source_path is not None:
-                    rendered = learning_service.render_meme(decision, source_path)
-                if rendered is None:
-                    used_decision = learning_service.fallback_command_meme_background(
-                        decision, message.chat.id
-                    )
-                    rendered = (
-                        learning_service.render_meme(used_decision)
-                        if used_decision else None
-                    )
-            else:
-                rendered = learning_service.render_meme(decision)
+            # Admission begins before a potentially large Telegram download and
+            # ends after Pillow rendering. Telegram delivery is outside the
+            # scarce media slot but remains inside the per-chat lifecycle gate.
+            with learning_service.media_work_slot(
+                event.chat_id, event.event_id
+            ) as admission:
+                if not admission:
+                    learning_service.discard_command_meme_candidate(decision)
+                    return False
+                if decision.background_file_id:
+                    source_path = download_chat_image(decision.background_file_id)
+                    if source_path is not None:
+                        rendered = learning_service.render_meme(decision, source_path)
+                    if rendered is None:
+                        used_decision = learning_service.fallback_command_meme_background(
+                            decision, event.chat_id
+                        )
+                        rendered = (
+                            learning_service.render_meme(used_decision)
+                            if used_decision else None
+                        )
+                else:
+                    rendered = learning_service.render_meme(decision)
             if not rendered:
+                learning_service.discard_command_meme_candidate(used_decision)
                 return False
-            with rendered.path.open("rb") as image:
-                bot.send_photo(
-                    message.chat.id, image, reply_to_message_id=message.message_id,
-                )
-            learning_service.mark_command_meme_sent(message.chat.id, used_decision)
-            return True
+            cleanup_paths = [rendered.path]
+            if source_path is not None:
+                cleanup_paths.append(source_path)
+            plan = learning_service.prepare_manual_meme_response(
+                event, used_decision, rendered.path, cleanup_paths
+            )
+            rendered = None
+            source_path = None
+            return execute_response_plan(plan).success
         except Exception as error:
+            learning_service.discard_command_meme_candidate(used_decision)
             logging.getLogger(__name__).warning(
                 "Не удалось отправить мем по команде: %s", type(error).__name__
             )
+            log_delivery(event.chat_id, "photo", False)
             return False
         finally:
             try:
@@ -584,7 +871,8 @@ WHO_COMMAND_RE = re.compile(
 )
 
 
-def handle_who(message, text):
+def handle_who(message, text, event=None):
+    event = event or normalize_telegram_event(message)
 
     match = WHO_COMMAND_RE.fullmatch(text)
 
@@ -597,8 +885,7 @@ def handle_who(message, text):
         bot.reply_to(message, "А кто что? Киберстулу нужна конкретика.")
         return True
 
-    author_id = message.from_user.id if message.from_user else None
-    user = random_known_user(author_id, message.chat.id)
+    user = random_known_user(event.user_id, event.chat_id)
 
     if user is None:
         bot.reply_to(
@@ -811,23 +1098,25 @@ def edit_chair_screen(call, text, keyboard):
 
 
 @bot.message_handler(commands=["chair_settings"])
-def chair_settings_command(message):
+@telegram_user_event_handler
+def chair_settings_command(message, event):
     if getattr(message.chat, "type", None) not in {"group", "supergroup"}:
         bot.reply_to(message, "панель работает только внутри конференции")
         return
     if not require_admin(message):
         return
     bot.send_message(
-        message.chat.id,
-        chair_main_text(message.chat.id),
-        reply_markup=chair_main_keyboard(message.chat.id),
+        event.chat_id,
+        chair_main_text(event.chat_id),
+        reply_markup=chair_main_keyboard(event.chat_id),
     )
 
 
 @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("chair:"))
-def chair_settings_callback(call):
-    chat_id = call.message.chat.id
-    user_id = getattr(getattr(call, "from_user", None), "id", None)
+@telegram_callback_event_handler
+def chair_settings_callback(call, event):
+    chat_id = event.chat_id
+    user_id = event.user_id
     if (
         getattr(call.message.chat, "type", None) not in {"group", "supergroup"}
         or not is_user_chat_admin(chat_id, user_id)
@@ -837,7 +1126,7 @@ def chair_settings_callback(call):
         )
         return
 
-    action = call.data
+    action = event.data
     if action == "chair:close":
         bot.edit_message_text(
             "панель закрыта\nстул снова делает вид что работает",
@@ -899,23 +1188,27 @@ def chair_settings_callback(call):
     bot.answer_callback_query(call.id)
 
 
-def is_creator_message(message):
+def is_creator_message(message_or_event):
     """Whether this message was written by CyberChair's creator.
 
     A mention of the creator is ordinary chat context, not an invitation for a
     privileged reply.  This keeps mentions from making the bot noticeably more
     talkative than it is with other participants.
     """
-    user = getattr(message, "from_user", None)
-    username = (getattr(user, "username", None) or "").casefold()
+    event = (
+        message_or_event if isinstance(message_or_event, NormalizedEvent)
+        else normalize_telegram_event(message_or_event)
+    )
+    username = (event.username or "").casefold()
     return username == learning_settings.creator_username
 
 
 @bot.message_handler(commands=["learn_status"])
-def learn_status_command(message):
+@telegram_user_event_handler
+def learn_status_command(message, event):
     if not require_admin(message):
         return
-    status = learning_service.status(message.chat.id)
+    status = learning_service.status(event.chat_id)
     readiness = "готова" if status["ready"] else "ещё обучается"
     bot.reply_to(
         message,
@@ -925,20 +1218,22 @@ def learn_status_command(message):
         f"Обучение: {'вкл' if status['learning'] else 'выкл'}\n"
         f"Случайные ответы: {'вкл' if status['talk'] else 'выкл'}\n"
         f"TrollMode: {'вкл' if status['troll_mode'] else 'выкл'}\n"
-        f"OpenAI: {'готов' if status['openai'] else 'нет ключа/выключен'}\n"
+        f"LLM ({status['provider']}): "
+        f"{'готов' if status['llm'] else 'нет ключа/выключен'}\n"
         f"Активность: {status['activity_percent']}%\n"
-        f"Сохранено GIF: {learning_service.repository(message.chat.id).gif_count()}\n"
-        f"Сохранено стикеров: {learning_service.repository(message.chat.id).sticker_count()}",
+        f"Сохранено GIF: {learning_service.repository(event.chat_id).gif_count()}\n"
+        f"Сохранено стикеров: {learning_service.repository(event.chat_id).sticker_count()}",
     )
 
 
 @bot.message_handler(commands=["activity"])
-def activity_command(message):
+@telegram_user_event_handler
+def activity_command(message, event):
     if not require_admin(message):
         return
-    arguments = message.text.split(maxsplit=1)
+    arguments = event.effective_text.split(maxsplit=1)
     if len(arguments) == 1:
-        current = learning_service.activity_percent(message.chat.id)
+        current = learning_service.activity_percent(event.chat_id)
         bot.reply_to(
             message,
             f"🤖 Активность Киберстула: {current}%\n"
@@ -952,28 +1247,30 @@ def activity_command(message):
     if percent not in {0, 25, 50, 75, 100}:
         bot.reply_to(message, "⚠ Укажите один уровень: 0, 25, 50, 75 или 100.")
         return
-    learning_service.set_activity_percent(message.chat.id, percent)
+    learning_service.set_activity_percent(event.chat_id, percent)
     bot.reply_to(message, f"🤖 Активность этого чата установлена на {percent}%.")
 
 
 @bot.message_handler(commands=["learn_on", "learn_off", "talk_on", "talk_off"])
-def toggle_learning_command(message):
+@telegram_user_event_handler
+def toggle_learning_command(message, event):
     if not require_admin(message):
         return
-    command = message.text.split()[0].split("@")[0].lower()
+    command = event.effective_text.split()[0].split("@")[0].lower()
     kind = "learning" if command.startswith("/learn_") else "talk"
     enabled = command.endswith("_on")
-    learning_service.set_enabled(message.chat.id, kind, enabled)
+    learning_service.set_enabled(event.chat_id, kind, enabled)
     bot.reply_to(message, f"Протокол {kind} {'активирован' if enabled else 'остановлен'}.")
 
 
 @bot.message_handler(commands=["troll_on", "troll_off"])
-def toggle_troll_mode_command(message):
+@telegram_user_event_handler
+def toggle_troll_mode_command(message, event):
     if not require_admin(message):
         return
-    command = message.text.split()[0].split("@")[0].lower()
+    command = event.effective_text.split()[0].split("@")[0].lower()
     enabled = command.endswith("_on")
-    learning_service.set_troll_mode(message.chat.id, enabled)
+    learning_service.set_troll_mode(event.chat_id, enabled)
     bot.reply_to(
         message,
         f"TrollMode {'включён' if enabled else 'выключен'} для этого чата.",
@@ -981,60 +1278,108 @@ def toggle_troll_mode_command(message):
 
 
 @bot.message_handler(commands=["forget_chat"])
-def forget_chat_command(message):
+@telegram_user_event_handler
+def forget_chat_command(message, event):
     if not require_admin(message):
         return
-    arguments = message.text.split(maxsplit=1)
+    arguments = event.effective_text.split(maxsplit=1)
     if len(arguments) != 2 or arguments[1].strip().lower() != "confirm":
         bot.reply_to(message, "⚠ Для удаления базы этого чата: /forget_chat confirm")
         return
-    learning_service.forget_chat(message.chat.id)
+    learning_service.forget_chat(event.chat_id)
     bot.reply_to(message, "🤖 Память этого чата уничтожена. Данные других чатов не затронуты.")
 
 
 @bot.message_handler(commands=["generate"])
-def generate_command(message):
+@telegram_user_event_handler
+def generate_command(message, event):
     if not require_admin(message):
         return
-    arguments = message.text.partition(" ")[2].strip()
+    arguments = event.effective_text.partition(" ")[2].strip()
     provider, separator, remaining = arguments.partition(" ")
     provider = provider.casefold()
-    if provider in {"markov", "марков"}:
-        generated = learning_service.generate_local(message.chat.id, remaining)
-    elif provider in {"ai", "openai", "ии"}:
-        generated = learning_service.generate_openai(message.chat.id, remaining, "reply")
+    with learning_service.response_planning():
+        if provider in {"markov", "марков"}:
+            generated, source_usage = learning_service.generate_local(
+                event.chat_id, remaining, return_sources=True
+            )
+            producer = Producer.MARKOV
+        elif provider in {"ai", "openai", "ии"}:
+            generated = learning_service.generate_llm(
+                event.chat_id, remaining, "reply"
+            )
+            producer = Producer.LLM
+            source_usage = ()
+        else:
+            generated = learning_service.generate_llm(
+                event.chat_id, arguments, "reply"
+            )
+            producer = Producer.LLM
+            source_usage = ()
+        actions = [GeneratedCommit(generated, "manual")] if generated else []
+        if source_usage:
+            actions.append(SourceUsageCommit(tuple(source_usage)))
+        plan = (
+            learning_service.prepare_text_response(
+                event, generated, "manual", producer=producer, required=True,
+                actions=actions,
+                provider_key=(
+                    str(getattr(
+                        learning_service.provider_for_chat(event.chat_id),
+                        "provider_key", "llm",
+                    ))
+                    if producer == Producer.LLM else None
+                ),
+            )
+            if generated else None
+        )
+    if plan:
+        execute_response_plan(plan, message)
     else:
-        generated = learning_service.generate_openai(message.chat.id, arguments, "reply")
-    if generated:
-        learning_service.repository(message.chat.id).record_generated(generated, "manual")
-        bot.reply_to(message, generated)
-    else:
-        bot.reply_to(message, "🤖 Генерация не удалась: проверьте ключ OpenAI или накопите больше сообщений.")
+        bot.reply_to(message, "🤖 Генерация не удалась: проверьте ключ LLM provider или накопите больше сообщений.")
 
 
-def send_contextual_response(message, response):
+def send_contextual_response(message, response, event=None):
     """Telegram-only sender for a provider-neutral text/media decision."""
+    if isinstance(response, ResponsePlan):
+        return execute_response_plan(response, message).success
+    event = event or normalize_telegram_event(message)
     if not isinstance(response, MediaDecision):
-        sent = bot.reply_to(message, response)
-        learning_service.attach_pending_bot_message(message, sent)
+        try:
+            sent = bot.reply_to(message, response)
+        except Exception:
+            log_delivery(message.chat.id, "text", False)
+            raise
+        log_delivery(message.chat.id, "text", True)
+        learning_service.attach_pending_bot_message(event, sent)
         return True
     if response.action == "gif":
         with chat_action_manager.activity(
             message.chat.id, MEDIA_CHAT_ACTIONS["gif"], "gif"
         ):
-            bot.send_animation(
-                message.chat.id, response.asset_id,
-                reply_to_message_id=message.message_id,
-            )
+            try:
+                bot.send_animation(
+                    message.chat.id, response.asset_id,
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception:
+                log_delivery(message.chat.id, "gif", False)
+                raise
+            log_delivery(message.chat.id, "gif", True)
         return True
     if response.action == "sticker":
         with chat_action_manager.activity(
             message.chat.id, MEDIA_CHAT_ACTIONS["sticker"], "sticker"
         ):
-            bot.send_sticker(
-                message.chat.id, response.asset_id,
-                reply_to_message_id=message.message_id,
-            )
+            try:
+                bot.send_sticker(
+                    message.chat.id, response.asset_id,
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception:
+                log_delivery(message.chat.id, "sticker", False)
+                raise
+            log_delivery(message.chat.id, "sticker", True)
         return True
     if response.action != "meme":
         return False
@@ -1050,12 +1395,14 @@ def send_contextual_response(message, response):
                     message.chat.id, image,
                     reply_to_message_id=message.message_id,
                 )
+            log_delivery(message.chat.id, "photo", True)
             return True
         except OSError as error:
             logging.getLogger(__name__).warning(
                 "Не удалось отправить contextual meme chat=%s: %s",
                 message.chat.id, type(error).__name__,
             )
+            log_delivery(message.chat.id, "photo", False)
             return False
         finally:
             learning_service.cleanup_rendered_meme(rendered)
@@ -1063,20 +1410,37 @@ def send_contextual_response(message, response):
 
 def send_autonomous_response(chat_id, response):
     """Telegram-only sender for scheduler-originated text or MediaDecision."""
+    if isinstance(response, ResponsePlan):
+        return execute_response_plan(response).success
     if not isinstance(response, MediaDecision):
-        bot.send_message(chat_id, response)
+        try:
+            bot.send_message(chat_id, response)
+        except Exception:
+            log_delivery(chat_id, "text", False)
+            raise
+        log_delivery(chat_id, "text", True)
         return True
     if response.action == "gif":
         with chat_action_manager.activity(
             chat_id, MEDIA_CHAT_ACTIONS["gif"], "gif"
         ):
-            bot.send_animation(chat_id, response.asset_id)
+            try:
+                bot.send_animation(chat_id, response.asset_id)
+            except Exception:
+                log_delivery(chat_id, "gif", False)
+                raise
+            log_delivery(chat_id, "gif", True)
         return True
     if response.action == "sticker":
         with chat_action_manager.activity(
             chat_id, MEDIA_CHAT_ACTIONS["sticker"], "sticker"
         ):
-            bot.send_sticker(chat_id, response.asset_id)
+            try:
+                bot.send_sticker(chat_id, response.asset_id)
+            except Exception:
+                log_delivery(chat_id, "sticker", False)
+                raise
+            log_delivery(chat_id, "sticker", True)
         return True
     if response.action != "meme":
         return False
@@ -1089,19 +1453,57 @@ def send_autonomous_response(chat_id, response):
         try:
             with rendered.path.open("rb") as image:
                 bot.send_photo(chat_id, image)
+            log_delivery(chat_id, "photo", True)
             return True
         finally:
             learning_service.cleanup_rendered_meme(rendered)
 
 
+def run_autonomous_response(chat_id, current, workday=True):
+    """Optional autonomous lifecycle: skip instead of queueing behind a user."""
+    with runtime_work("autonomous") as runtime_admission:
+        if not runtime_admission:
+            return None
+        with learning_service.autonomous_chat_event_slot(
+            chat_id, current
+        ) as admission:
+            if not admission:
+                return None
+            response = learning_service.prepare_autonomous(chat_id, current, workday)
+            if response:
+                send_autonomous_response(chat_id, response)
+    # The scheduler's legacy sender must not run after this combined lifecycle.
+    return None
+
+
+def run_memory_maintenance(chat_id, current):
+    with runtime_work("memory") as admission:
+        if not admission:
+            return None
+        return learning_service.run_memory_maintenance(chat_id, current)
+
+
 @bot.message_handler(content_types=["animation"])
-def remember_animation(message):
-    learning_service.ingest_gif(message)
+@telegram_user_event_handler
+def remember_animation(message, event):
+    learning_service.ingest_gif(event)
 
 
 @bot.message_handler(content_types=["photo"])
-def remember_photo(message):
-    learning_service.ingest_chat_image(message)
+@telegram_user_event_handler
+def remember_photo(message, event):
+    # Telegram stores photo text in caption. This special command owns the
+    # event before collection, direct-address routing, policy or AI text flow.
+    meme_match = CHAIR_MEME_COMMAND_RE.fullmatch(event.effective_text)
+    if meme_match:
+        if not send_manual_meme(
+            message, hint=meme_match.group("hint") or "", event=event
+        ):
+            logging.getLogger(__name__).warning(
+                "Не удалось собрать мем по photo caption chat=%s", message.chat.id
+            )
+        return
+    learning_service.ingest_chat_image(event)
 
 
 @bot.message_handler(
@@ -1111,24 +1513,27 @@ def remember_photo(message):
         and str(getattr(m.document, "mime_type", "") or "").casefold().startswith("image/")
     ),
 )
-def remember_image_document(message):
-    learning_service.ingest_chat_image(message)
-    if str(getattr(message.document, "mime_type", "") or "").casefold() == "image/gif":
-        learning_service.ingest_gif(message)
+@telegram_user_event_handler
+def remember_image_document(message, event):
+    learning_service.ingest_chat_image(event)
+    if (event.mime_type or "").casefold() == "image/gif":
+        learning_service.ingest_gif(event)
 
 
 @bot.message_handler(content_types=["sticker"])
-def remember_sticker(message):
-    learning_service.ingest_sticker(message)
+@telegram_user_event_handler
+def remember_sticker(message, event):
+    learning_service.ingest_sticker(event)
 
 @bot.message_handler(func=lambda m: m.text is not None)
-def handle_message(message):
+@telegram_user_event_handler
+def handle_message(message, event):
 
-    text = message.text
+    text = event.effective_text
 
     # Kucher mentions have the highest routing priority and are independent of
     # learning, activity level and every other command module.
-    if freekucher_reaction(message):
+    if freekucher_reaction(message, event):
         return
 
     # These are control phrases, not dialogue: never learn them, answer them or
@@ -1138,45 +1543,53 @@ def handle_message(message):
 
     meme_match = CHAIR_MEME_COMMAND_RE.fullmatch(text)
     if meme_match:
-        if send_manual_meme(message, hint=meme_match.group("hint") or ""):
+        if send_manual_meme(
+            message, hint=meme_match.group("hint") or "", event=event
+        ):
             return
         logging.getLogger(__name__).warning("Не удалось собрать мем по команде chat=%s", message.chat.id)
         return
 
     if CHAIR_REMAINING_COMMAND_RE.fullmatch(text):
-        bot.reply_to(message, chair_remaining_message())
+        plan = learning_service.prepare_text_response(
+            event, chair_remaining_message(), "chair_remaining", required=True
+        )
+        execute_response_plan(plan, message)
         return
 
-    if is_sglypa_message(message):
-        if learning_service.activity_allows(message.chat.id):
-            sglypa_reaction(message)
+    if is_sglypa_message(event):
+        if learning_service.activity_allows(event.chat_id):
+            sglypa_reaction(message, event)
         return
 
-    remember_user(message)
+    remember_user(event)
 
     if VOICE_STORY_COMMAND_RE.search(text):
-        if not learning_service.troll_mode(message.chat.id):
+        if not learning_service.troll_mode(event.chat_id):
             return
-        remaining = learning_service.take_voice_story_cooldown_notice(message.chat.id)
+        remaining = learning_service.take_voice_story_cooldown_notice(event.chat_id)
         if remaining > 0:
             minutes, seconds = divmod(remaining, 60)
-            bot.reply_to(
-                message,
+            plan = learning_service.prepare_text_response(
+                event,
                 "🎙 Киберстул голос на кулдауне "
                 f"осталось {minutes} мин {seconds} сек",
+                "voice_cooldown", required=True,
             )
+            receipt = execute_response_plan(plan, message)
+            if not receipt.success:
+                learning_service.release_voice_story_cooldown_notice(event.chat_id)
             return
-        story = learning_service.maybe_voice_story(message)
+        with learning_service.response_planning():
+            learning_service.context_snapshot(event)
+            story = learning_service.maybe_voice_story(event)
         if story:
-            bot.reply_to(message, story)
+            send_contextual_response(message, story, event)
         return
 
     is_who_command = bool(WHO_COMMAND_RE.fullmatch(text))
     identity = get_bot_identity()
-    reply_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
-    replies_to_chair = bool(
-        reply_user and identity["id"] and reply_user.id == identity["id"]
-    )
+    replies_to_chair = event.replies_to_user(identity["id"])
     mentions_chair = bool(
         identity["username"]
         and f"@{identity['username']}".casefold() in text.casefold()
@@ -1189,101 +1602,101 @@ def handle_message(message):
         explicit_chair or replies_to_chair or mentions_chair or configured_address
     )
     pending_candidate = not is_who_command and not direct_candidate and learning_service.is_pending_continuation(
-        message, bot_id=identity["id"]
+        event, bot_id=identity["id"]
     )
     # A direct turn must not accidentally trigger a summary request and then a
     # second conversational request on the same incoming event.
     if direct_candidate or pending_candidate:
-        learning_service.ingest(message, refresh_memory=False)
+        learning_service.ingest_event(event, refresh_memory=False)
     else:
-        learning_service.ingest(message)
+        learning_service.ingest_event(event)
 
     # The complete "к кто ..." command has priority over words inside its
     # argument, including "стул" and "стульчик".
     if is_who_command:
         if (
-            learning_service.troll_mode(message.chat.id)
-            and learning_service.activity_allows(message.chat.id)
+            learning_service.troll_mode(event.chat_id)
+            and learning_service.activity_allows(event.chat_id)
         ):
-            handle_who(message, text)
+            handle_who(message, text, event)
         return
+
+    # R3 builds one immutable read view after ingest and before response routing.
+    learning_service.context_snapshot(event)
 
     # A pending continuation belongs to the same mandatory-response lane as a
     # direct address, but has higher dialogue priority and one final producer.
     if pending_candidate:
-        generated = learning_service.maybe_pending_continuation(
-            message, bot_id=identity["id"]
-        )
+        with learning_service.response_planning():
+            generated = learning_service.maybe_pending_continuation(
+                event, bot_id=identity["id"]
+            )
         if generated:
-            send_contextual_response(message, generated)
+            send_contextual_response(message, generated, event)
         return
 
     # Special commands above own their event. All remaining explicit chair
     # addresses and replies enter one mandatory-response arbitration path
     # before activity sampling/cooldowns can discard them.
     if direct_candidate:
-        generated = learning_service.maybe_direct_reply(
-            message,
+        with learning_service.response_planning():
+            generated = learning_service.maybe_direct_reply(
+                event,
+                bot_id=identity["id"],
+                bot_username=identity["username"],
+                explicit_address=explicit_chair,
+            )
+        if generated:
+            send_contextual_response(message, generated, event)
+        return
+
+    if not learning_service.activity_allows(event.chat_id):
+        return
+
+    if is_creator_message(event):
+        with learning_service.response_planning():
+            generated = learning_service.maybe_special_ai(
+                event,
+                # Share the ordinary random-reply bucket and probability, so
+                # the creator never receives more unsolicited reactions than
+                # other chat members.
+                "random",
+                learning_settings.random_reply_chance,
+                "creator",
+                addressed=False,
+            )
+        if generated:
+            send_contextual_response(message, generated, event)
+        return
+
+    if learning_service.troll_mode(event.chat_id) and reaction_text(message, event):
+        return
+
+    with learning_service.response_planning():
+        generated = learning_service.maybe_reply(
+            event,
             bot_id=identity["id"],
             bot_username=identity["username"],
-            explicit_address=explicit_chair,
         )
-        if generated:
-            send_contextual_response(message, generated)
-        return
-
-    if not learning_service.activity_allows(message.chat.id):
-        return
-
-    if is_creator_message(message):
-        generated = learning_service.maybe_special_ai(
-            message,
-            # Share the ordinary random-reply bucket and probability, so
-            # the creator never receives more unsolicited reactions than
-            # other chat members.
-            "random",
-            learning_settings.random_reply_chance,
-            "creator",
-            addressed=False,
-        )
-        if generated:
-            bot.reply_to(message, generated)
-        return
-
-    if learning_service.troll_mode(message.chat.id) and reaction_text(message):
-        return
-
-    generated = learning_service.maybe_reply(
-        message,
-        bot_id=identity["id"],
-        bot_username=identity["username"],
-    )
     if generated:
-        send_contextual_response(message, generated)
+        send_contextual_response(message, generated, event)
 
 # ==========================================
 # ЗАПУСК БОТА
 # ==========================================
 
 def main():
+    global _runtime_shutdown_coordinator
 
-    missing = []
-    if TOKEN == "0:development":
-        missing.append("TELEGRAM_BOT_TOKEN")
-    active_provider = learning_service.llm_provider_name(CHAT_ID)
-    if not learning_service.provider_available(CHAT_ID, active_provider):
-        missing.append(
-            "XAI_API_KEY (LLM_PROVIDER=grok)"
-            if active_provider == "grok"
-            else "OPENAI_API_KEY (LLM_PROVIDER=openai)"
-        )
-    if missing:
-        raise RuntimeError(
-            "Не заполнены обязательные настройки: " + ", ".join(missing)
-            + ". Укажите их в .env (предпочтительно) или .env.example."
-        )
-
-    threading.Thread(
+    previous_runtime = _runtime_shutdown_coordinator
+    polling_active = threading.Event()
+    scheduler_stop = threading.Event()
+    coordinator = ShutdownCoordinator(
+        learning_settings.shutdown_grace_seconds,
+        diagnostics=_shutdown_diagnostics,
+    )
+    _runtime_shutdown_coordinator = coordinator
+    scheduler_thread = threading.Thread(
         target=scheduler,
         args=(
             bot,
@@ -1293,7 +1706,7 @@ def main():
             WORK_START_MINUTE,
             WORK_END_HOUR,
             WORK_END_MINUTE,
-            learning_service.maybe_autonomous,
+            run_autonomous_response,
             # Autonomous media is selected only after AutonomousPolicy has
             # accepted a contextual intervention.  Keep the legacy callback
             # available on LearningService, but do not run a second random
@@ -1301,47 +1714,111 @@ def main():
             None,
             learning_service.activity_allows,
             learning_service.activity_percent,
-            learning_service.claim_scheduled_event,
-            send_autonomous_response,
+            None,
+            None,
             send_daily_freekucher,
+            run_memory_maintenance,
+            run_scheduled_notification,
+            retry_scheduled_notifications,
+            scheduler_stop,
         ),
+        name="cyberchair-scheduler",
         daemon=True,
-    ).start()
-
-    print("=" * 50)
-    print(
-        f"🤖 Бот 'Киберстул' "
-        f"версии {BOT_VERSION} запущен"
     )
-    print(
-        f"🕒 Время: "
-        f"{WORK_START_HOUR:02d}:{WORK_START_MINUTE:02d}"
-        f" - "
-        f"{WORK_END_HOUR:02d}:{WORK_END_MINUTE:02d}"
+    coordinator.register_component(
+        "telegram_polling",
+        stop=bot.stop_polling,
+        stopped=lambda: not polling_active.is_set(),
     )
-    print(f"🌍 Часовой пояс: {TIMEZONE}")
-    print("📅 Режим: Понедельник–Пятница")
-    print("=" * 50)
-    print("Запускаем бесконечный поллинг...")
+    coordinator.register_component(
+        "scheduler",
+        stop=scheduler_stop.set,
+        stopped=lambda: not scheduler_thread.is_alive(),
+    )
+    coordinator.register_component(
+        "concurrency_admission",
+        stop=learning_service.concurrency.shutdown,
+    )
+    coordinator.register_component(
+        "chat_actions",
+        stop=chat_action_manager.shutdown,
+        stopped=lambda: chat_action_manager.worker_count() == 0,
+    )
+    coordinator.register_cleanup("telebot_workers", _stop_telebot_workers)
 
-    send_startup_meme()
+    previous_signals = {}
 
-    while True:
+    def request_from_signal(signum, _frame):
+        coordinator.request_shutdown(signal.Signals(signum).name)
 
-        try:
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_signals[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_from_signal)
 
-            bot.infinity_polling(
-                skip_pending=True,
-                timeout=30,
-                long_polling_timeout=30,
+        missing = []
+        if TOKEN == "0:development":
+            missing.append("TELEGRAM_BOT_TOKEN")
+        active_provider = learning_service.llm_provider_name(CHAT_ID)
+        if not learning_service.provider_available(CHAT_ID, active_provider):
+            missing.append(
+                "XAI_API_KEY (LLM_PROVIDER=grok)"
+                if active_provider == "grok"
+                else "OPENAI_API_KEY (LLM_PROVIDER=openai)"
+            )
+        if missing:
+            raise RuntimeError(
+                "Не заполнены обязательные настройки: " + ", ".join(missing)
+                + ". Укажите их в .env (предпочтительно) или .env.example."
             )
 
-        except Exception as e:
+        scheduler_thread.start()
 
-            print(f"Ошибка: {e}")
-            print("Переподключение через 10 секунд...")
+        print("=" * 50)
+        print(
+            f"🤖 Бот 'Киберстул' "
+            f"версии {BOT_VERSION} запущен"
+        )
+        print(
+            f"🕒 Время: "
+            f"{WORK_START_HOUR:02d}:{WORK_START_MINUTE:02d}"
+            f" - "
+            f"{WORK_END_HOUR:02d}:{WORK_END_MINUTE:02d}"
+        )
+        print(f"🌍 Часовой пояс: {TIMEZONE}")
+        print("📅 Режим: Понедельник–Пятница")
+        print("=" * 50)
+        print("Запускаем бесконечный поллинг...")
 
-            time.sleep(10)
+        with coordinator.work("startup") as admitted:
+            if admitted:
+                send_startup_meme()
+
+        while coordinator.is_running:
+            try:
+                polling_active.set()
+                bot.infinity_polling(
+                    skip_pending=True,
+                    timeout=30,
+                    long_polling_timeout=30,
+                )
+            except Exception as error:
+                if coordinator.is_draining:
+                    break
+                print(f"Ошибка: {error}")
+                print("Переподключение через 10 секунд...")
+                coordinator.shutdown_event.wait(10)
+            finally:
+                polling_active.clear()
+    finally:
+        coordinator.request_shutdown("runtime_exit")
+        coordinator.drain("runtime_exit")
+        for signum, previous in previous_signals.items():
+            signal.signal(signum, previous)
+        # Imported runtimes may be invoked repeatedly by tests/embedders. The
+        # real ``python bot.py`` process keeps the stopped guard until exit.
+        if __name__ != "__main__":
+            _runtime_shutdown_coordinator = previous_runtime
 
 
 if __name__ == "__main__":

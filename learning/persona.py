@@ -4,8 +4,8 @@ import re
 
 from .llm_provider import GenerateRequest
 from .meme_lexicon import MemeLexicon
-from .preprocessing import normalize_spaces, significant_words
-from .repository import memories_are_similar, normalize_memory
+from .preprocessing import lexical_stem, normalize_spaces, significant_words
+from .repository import memories_are_similar
 
 
 CYBERCHAIR_BASE_PERSONA = """Ты CyberChair / chairOS by id:28 — офисный стул-киборг, терминатор и давний участник этой неформальной Telegram-конфы, не ChatGPT и не помощник. Пятнадцать лет на имиджбордах: злой, язвительный, циничный, токсично-дружеский матерящийся друг; современный зумерский брейнрот и машинный flavour — приправы, не шаблон.
@@ -109,6 +109,46 @@ class PersonaBuilder:
             "meme_caption": "Придумай одну короткую подпись для мема по выбранной цитате/контексту чата: 3–10 слов, без кавычек, без emoji и пояснений. Обычный мат разрешён без маскировки и зависит от troll_intensity. При troll intensity 0.5+ добавь 1 уместную зумерскую/imageboard-конструкцию; при 0.7+ это обязательно, но без салата из сленга.",
         }.get(purpose, "Напиши короткую уместную реплику CyberChair.")
 
+    @staticmethod
+    def response_purpose(purpose, context=""):
+        value = normalize_spaces(context).casefold()
+        if purpose == "meme_caption":
+            return "meme_caption"
+        if purpose == "troll_user":
+            return "troll_user"
+        if purpose == "sglypa":
+            return "sglypa"
+        if purpose == "autonomous":
+            return "autonomous"
+        if purpose in {"random_reply", "creator", "stul_cooldown"}:
+            return "short_social"
+        if purpose == "voice_story":
+            return "voice_story"
+        if re.search(r"\b(?:рецепт|приготов|свари|испе[чк]|харчо|хачапури)\w*", value):
+            return "recipe_instruction"
+        if re.search(r"\b(?:настро|установ|восстанов|мигрир|пошаг|инструкц|docker|postgres|dns|nginx|резервн|роутер|домашн\w*\s+сет|план\w*\s+набор\w*\s+вес)\w*", value):
+            return "complex_explanation"
+        if re.search(r"\b(?:выбрать|выбор|посовет|рекоменд|стоит\s+ли|имеет\s+смысл|vps)\b", value):
+            return "recommendation"
+        if re.search(r"\b(?:мнение|думаешь|как\s+тебе|оцени)\b", value):
+            return "opinion"
+        return "useful_answer" if purpose in {"question", "reply"} else "short_social"
+
+    def output_budget(self, response_purpose):
+        return {
+            "short_social": self.settings.short_max_output_tokens,
+            "troll_user": self.settings.troll_user_max_output_tokens,
+            "opinion": self.settings.opinion_max_output_tokens,
+            "recommendation": self.settings.recommendation_max_output_tokens,
+            "useful_answer": self.settings.useful_max_output_tokens,
+            "recipe_instruction": self.settings.recipe_max_output_tokens,
+            "complex_explanation": self.settings.complex_max_output_tokens,
+            "meme_caption": min(64, self.settings.meme_max_output_tokens),
+            "voice_story": 150,
+            "sglypa": 50,
+            "autonomous": self.settings.autonomous_max_output_tokens,
+        }.get(response_purpose, self.settings.short_max_output_tokens)
+
     def select_callbacks(self, day_summary, stable_memory, text, dominant_topic):
         source = []
         for key in ("inside_jokes", "callback_jokes"):
@@ -117,24 +157,30 @@ class PersonaBuilder:
         terms = set(significant_words(f"{text or ''} {dominant_topic or ''}"))
         if not terms:
             return ()
-        unique = []
-        for value in source:
+        scored = []
+        for source_index, value in enumerate(source):
             value = normalize_spaces(str(value))[:180]
-            if not value or any(memories_are_similar(value, old) for old in unique):
+            if not value or any(memories_are_similar(value, old[2]) for old in scored):
                 continue
             value_terms = set(significant_words(value))
             # Russian inflection should not make a real callback invisible:
             # "игру" must still find a stored "игры" event. A short stem
             # stem is only a relevance hint, never permission to invent memory.
-            stems = {word[:3] for word in terms if len(word) >= 4}
-            value_stems = {word[:3] for word in value_terms if len(word) >= 4}
-            if value_terms & terms or stems & value_stems:
-                unique.append(value)
-        return tuple(unique[:2])
+            stems = {lexical_stem(word) for word in terms if len(word) >= 3}
+            value_stems = {lexical_stem(word) for word in value_terms if len(word) >= 3}
+            exact = len(value_terms & terms)
+            stem = len(stems & value_stems)
+            if exact or stem:
+                # Topic relevance intentionally dominates source order/recency.
+                score = exact * 6 + stem * 2 - source_index * .001
+                scored.append((score, source_index, value))
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        return tuple(item[2] for item in scored[:2])
 
     def build_request(self, chat_id, context=None, purpose="autonomous", safety_identifier=None,
                       history=None, conversation_decision=None, chat_state=None,
-                      troll_mode=True, day_summary=None, stable_memory=None):
+                      troll_mode=True, day_summary=None, stable_memory=None,
+                      lexical_penalties=()):
         intensity = float(getattr(conversation_decision, "troll_intensity", .6))
         style = getattr(conversation_decision, "preferred_style", "chatty")
         conversation_type = getattr(chat_state, "conversation_type", "casual")
@@ -142,6 +188,7 @@ class PersonaBuilder:
         dominant_topic = getattr(chat_state, "dominant_topic", None)
         target_id = getattr(conversation_decision, "target_message_id", None)
         callbacks = self.select_callbacks(day_summary, stable_memory, context, dominant_topic) if troll_mode else ()
+        response_purpose = self.response_purpose(purpose, context)
         selected = []
         if troll_mode:
             contexts = {conversation_type, "mocking" if style == "direct_mocking" else style}
@@ -204,10 +251,19 @@ class PersonaBuilder:
             prompt += f"\n\nДоступные русифицированные мемы ({meme_rule}):\n" + "\n".join(
                 f"- {entry.output}: {entry.meaning}" for entry in selected
             )
+        if lexical_penalties:
+            prompt += (
+                "\n\nНедавно CyberChair слишком часто использовал эти заметные слова/конструкции: "
+                + ", ".join(lexical_penalties[:8])
+                + ". Не бань их и не ищи натужный синоним, но мягко избегай повторения, особенно в начале; используй снова только если это действительно лучшая формулировка по контексту."
+            )
         prompt += "\n\nБез технических префиксов, системных меток и декоративных символов. Уместный emoji вроде 💀 🗿 🪑 🤖 допустим, но не завершай им сообщения автоматически."
         metadata = {
             "chat_id": chat_id,
             "purpose": purpose,
+            "response_purpose": response_purpose,
+            "output_budget": self.output_budget(response_purpose),
+            "lexical_penalties": list(lexical_penalties[:8]),
             "behavior_mode": (
                 "troll_user" if purpose == "troll_user"
                 else "useful_answer" if purpose in {"question", "reply"} else "chat"
@@ -232,15 +288,7 @@ class PersonaBuilder:
         request = GenerateRequest(
             instructions=instructions,
             input=prompt,
-            max_output_tokens=(
-                150 if purpose == "voice_story"
-                else 50 if purpose == "sglypa"
-                else min(64, self.settings.meme_max_output_tokens)
-                if purpose == "meme_caption"
-                else self.settings.autonomous_max_output_tokens
-                if purpose == "autonomous"
-                else self.settings.reply_max_output_tokens
-            ),
+            max_output_tokens=self.output_budget(response_purpose),
             safety_identifier=safety_identifier,
             metadata=metadata,
         )

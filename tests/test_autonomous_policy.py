@@ -10,6 +10,7 @@ from learning.autonomous_policy import AutonomousPolicy
 from learning.chat_state import ChatState
 from learning.conversation_policy import ConversationPolicy
 from learning.media_service import MediaDecision
+from learning.response_plan import DeliveryReceipt
 from learning.service import LearningService
 from learning.settings import LearningSettings
 
@@ -100,7 +101,7 @@ class AutonomousServiceTests(unittest.TestCase):
         provider = Mock(available=True)
         service = LearningService(self.settings, llm_provider=provider)
         with patch.object(service.chat_state_analyzer, "analyze", return_value=state(120)):
-            self.assertIsNone(service.maybe_autonomous(-1, NOW))
+            self.assertIsNone(service.prepare_autonomous(-1, NOW))
         provider.generate.assert_not_called()
 
     def test_selected_text_calls_llm_once_after_local_policy(self):
@@ -128,8 +129,14 @@ class AutonomousServiceTests(unittest.TestCase):
             patch.object(service, "activity_allows", return_value=True),
             patch.object(service.media, "decide", return_value=MediaDecision()),
         ):
-            result = service.maybe_autonomous(-1, NOW)
-        self.assertEqual(result, "ну релиз конечно кукд")
+            plan = service.prepare_autonomous(-1, NOW)
+        self.assertEqual(plan.payload.text, "ну релиз конечно кукд")
         self.assertEqual(events, ["typing", "llm"])
         provider.generate.assert_called_once()
+        service.finalize_response(
+            plan,
+            DeliveryReceipt(
+                plan.event_id, True, plan.delivery_type, telegram_message_id=42
+            ),
+        )
         self.assertEqual(repository.latest_generated(("autonomous",))["kind"], "autonomous")

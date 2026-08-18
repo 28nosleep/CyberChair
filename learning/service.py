@@ -1,84 +1,94 @@
+"""Composition root and supported compatibility facade for CyberChair core."""
+
 import logging
 import random
 import re
 import threading
-import hashlib
 import time
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
-from .filters import similarity, validate_generated
 from .chat_state import ChatStateAnalyzer
 from .conversation_policy import ConversationPolicy
-from .direct_address import DirectAddressRouter, SOCIAL, SUBSTANTIVE
+from .direct_address import DirectAddressRouter
 from .local_responder import LocalResponder
 from .cost_diagnostics import TICKS_PER_USD
 from .autonomous_policy import AutonomousPolicy
 from .generator import LocalGenerator
-from .markov import MarkovModel
 from .media_catalog import MediaCatalog
-from .media_service import MediaDecision, MediaService
+from .media_service import MediaService
 from .memory_service import MemoryService
+from .memory_maintenance import MemoryMaintenanceRunner
+from .generation_coordinator import GenerationCoordinator
+from .response_lifecycle import ResponseLifecycle
+from .media_coordinator import MediaCoordinator
+from .memory_facade import MemoryFacade
+from .foreground_orchestrator import ForegroundOrchestrator
+from .autonomous_coordinator import AutonomousCoordinator
+from .scheduled_delivery import ScheduledDeliveryCoordinator, ScheduledEventSpec
 from .meme_lexicon import MemeLexicon
 from .meme_renderer import MemeRenderer
-from .meme_sources import MemeSource, MemeSourceSelector
+from .meme_sources import MemeSourceSelector
 from .persona import PersonaBuilder
-from .pending_conversation import (
-    PendingConversation,
-    expected_answer_type,
-    extract_clarification,
-    looks_like_continuation,
-    pending_mode,
-    question_intent,
-    is_ambiguous_choice_request,
-    choice_declined,
-    extract_choice_alternatives,
-)
+from .lexical_diversity import LexicalDiversityTracker
+from .response_quality import ResponseQualityGuard
+from .context_snapshot import ContextSnapshotBuilder
+from .concurrency import process_concurrency_controller
 from .preprocessing import (
     FOREIGN_BOT_COMMAND_RE,
     VOICE_STORY_COMMAND_RE,
     normalize_spaces,
-    rejection_reason,
-    significant_words,
 )
 from .repository import ChatRepository
 from .provider_factory import create_llm_provider, create_llm_providers
 from .triggers import TriggerEngine
+from .event_context import (
+    EventContext,
+    autonomous_event_id,
+    bind_event,
+    current_event,
+    current_event_id,
+    implicit_event_id,
+    runtime_concurrency,
+)
+from .normalized_event import (
+    NormalizedCallbackEvent,
+    NormalizedEvent,
+    normalize_telegram_event,
+)
+from .response_plan import Producer
 
 log = logging.getLogger(__name__)
 
 
-PROVIDER_REFUSAL_RE = re.compile(
-    r"^(?:извините[,! ]*)?(?:я\s+)?(?:не\s+могу|не\s+стану|не\s+буду)\s+"
-    r"(?:помочь|поддержать|выполнить|ответить|участвовать|продолжить)|"
-    r"^(?:давайте|пожалуйста)\s+(?:сохранять|поддерживать)\s+уважительн",
-    re.I,
+_response_planning = ContextVar("cyberchair_response_planning", default=False)
+_planned_persona_usage = ContextVar(
+    "cyberchair_planned_persona_usage", default=None
+)
+_current_context_snapshot = ContextVar(
+    "cyberchair_context_snapshot", default=None
 )
 
 
-def looks_like_provider_refusal(text):
-    """Recognize a provider refusal so normal routing can use its local fallback."""
-    return bool(PROVIDER_REFUSAL_RE.search(normalize_spaces(text or "")))
+def _response_planning_active():
+    return bool(_response_planning.get())
 
-SUBSCRIPTION_REQUIRED = (
-    "🔒 OpenAI-модуль Киберстула доступен только в основном чате. "
-    "Для этого чата потребуется подписка."
+
+def _plan_persona_usage(meme_ids, cooldown_groups):
+    _planned_persona_usage.set((tuple(meme_ids), tuple(cooldown_groups)))
+
+
+def _take_planned_persona_usage():
+    value = _planned_persona_usage.get()
+    _planned_persona_usage.set(None)
+    return value
+
+
+PHOTO_MEME_CAPTION_RE = re.compile(
+    r"^\s*с\s+м\s+стул(?:\s+(?P<hint>.+))?\s*$", re.I
 )
-
-# These are jokes about being invoked, rather than about the conversation.
-# The first genuinely novel one may pass; repeats are suppressed for a long
-# time by _chair_call_meta_joke_on_cooldown.
-CHAIR_CALL_META_JOKE_RE = re.compile(
-    r"(?:опять|снова|вновь).{0,30}(?:зов[её]т|ор[её]т|клич[её]т|вызвал|позвал)"
-    r".{0,30}(?:стул|меня)|(?:зов[её]те|ор[её]те|кличете).{0,30}(?:стул|меня)",
-    re.I,
-)
-
-SAFE_CHAT_IMAGE_MIME_TYPES = {
-    "image/jpeg", "image/jpg", "image/png", "image/webp",
-    "image/gif", "image/bmp", "image/tiff",
-}
 
 
 class LearningService:
@@ -90,8 +100,14 @@ class LearningService:
         clock=None,
         llm_provider=None,
         xai_client=None,
+        concurrency_controller=None,
     ):
         self.settings = settings
+        self._lock = threading.RLock()
+        self._clock = clock or time.monotonic
+        self.concurrency = concurrency_controller or process_concurrency_controller(
+            settings, runtime_concurrency
+        )
         self.rng = rng or random
         self.triggers = TriggerEngine(settings, self.rng, clock)
         self.local = LocalGenerator(settings, self.rng)
@@ -106,49 +122,204 @@ class LearningService:
         if self._injected_provider is not None:
             self.providers = {settings.llm_provider.strip().casefold(): self._injected_provider}
             self.llm_provider = self._injected_provider
-            # Backward compatibility for tests/callers using service.openai.
-            self.openai = self._injected_provider
         else:
             self.providers = create_llm_providers(settings, openai_client, xai_client)
             self.llm_provider = self.providers[settings.llm_provider.strip().casefold()]
-            self.openai = self.providers["openai"]
-            self.grok = self.providers["grok"]
         for provider in self.providers.values():
             if hasattr(provider, "_usage_recorder") or provider.__class__.__module__.startswith("learning."):
                 provider._usage_recorder = self._record_llm_usage
         self.memory = MemoryService(
             settings, self.llm_provider, self._speaker_name,
             provider_resolver=self.provider_for_chat,
+            concurrency_controller=self.concurrency,
         )
+        self.memory_maintenance = MemoryMaintenanceRunner(
+            self.memory,
+            self.concurrency,
+            self.provider_for_chat,
+            self.llm_allowed,
+        )
+        self.context_snapshot_builder = ContextSnapshotBuilder(settings, self.memory)
         self.chat_state_analyzer = ChatStateAnalyzer(settings, self.memory)
         self.conversation_policy = ConversationPolicy(settings)
         self.autonomous_policy = AutonomousPolicy(settings, self.conversation_policy)
         self.meme_lexicon = MemeLexicon()
+        self.lexical_diversity = LexicalDiversityTracker()
+        self.quality_guard = ResponseQualityGuard(self.lexical_diversity)
         self.persona = PersonaBuilder(settings, self.meme_lexicon)
         self.direct_router = DirectAddressRouter()
-        self.local_responder = LocalResponder(self.meme_lexicon, self.rng)
+        self.local_responder = LocalResponder(
+            self.meme_lexicon, self.rng, self.lexical_diversity
+        )
         self.media_catalog = MediaCatalog()
         self.media = MediaService(settings, self.media_catalog, self.rng)
         self.meme_renderer = MemeRenderer(
             self.media_catalog, self.settings.data_dir / "generated_media"
         )
         self.meme_sources = MemeSourceSelector(self.rng)
-        self._last_policy_target_user = {}
-        self._policy_target_streak = {}
-        self._policy_answered_messages = {}
-        self._last_chat_state = {}
-        self._last_conversation_decision = {}
-        self._last_autonomous_decision = {}
-        self._last_direct_decision = {}
+        self.generation = GenerationCoordinator(
+            settings=self.settings,
+            repository=self.repository,
+            active_context_snapshot=self._active_context_snapshot,
+            memory=self.memory,
+            local=self.local,
+            quality_guard=self.quality_guard,
+            lexical_diversity=self.lexical_diversity,
+            persona=self.persona,
+            concurrency=self.concurrency,
+            provider_for_chat=self.provider_for_chat,
+            provider_name=self.llm_provider_name,
+            injected_provider=self._injected_provider,
+            troll_mode=self.troll_mode,
+            planning_active=_response_planning_active,
+            plan_persona_usage=_plan_persona_usage,
+            llm_allowed_check=self.llm_allowed,
+            lock=self._lock,
+        )
         self._repositories = {}
-        self._models = OrderedDict()
-        self._model_counts = {}
-        self._voice_cooldown_notices = {}
         self._command_meme_sources = {}
-        self._clock = clock or time.monotonic
+        self.scheduled_delivery = ScheduledDeliveryCoordinator(
+            self.repository,
+            lease_seconds=settings.scheduled_claim_lease_seconds,
+            max_attempts=settings.scheduled_delivery_max_attempts,
+            backoff_base_seconds=(
+                settings.scheduled_retry_backoff_base_seconds
+            ),
+            backoff_cap_seconds=settings.scheduled_retry_backoff_cap_seconds,
+        )
+        self.memory_facade = MemoryFacade(
+            settings=self.settings,
+            repository=self.repository,
+            normalize_event=self._normalized_event,
+            enabled=self._enabled,
+            triggers=self.triggers,
+            invalidate_generation=self.generation.invalidate_chat,
+            memory_maintenance=self.memory_maintenance,
+            troll_mode=self.troll_mode,
+            provider_name=self.llm_provider_name,
+            provider_available=self.provider_available,
+            activity_percent=self.activity_percent,
+            autonomous_enabled=self.autonomous_enabled,
+            media_enabled=self.media_enabled,
+        )
+        self.media_coordinator = MediaCoordinator(
+            settings=self.settings,
+            repository=self.repository,
+            normalize_event=self._normalized_event,
+            active_snapshot=self._active_context_snapshot,
+            media=self.media,
+            media_catalog=self.media_catalog,
+            meme_renderer=self.meme_renderer,
+            meme_sources=self.meme_sources,
+            quality_guard=self.quality_guard,
+            memory=self.memory,
+            persona=self.persona,
+            rng=self.rng,
+            concurrency=self.concurrency,
+            activity_allows=self.activity_allows,
+            media_enabled=self.media_enabled,
+            troll_mode=self.troll_mode,
+            provider_available=self.provider_available,
+            generate_llm=self.generate_llm,
+            generate_local=self.generate_local,
+            command_meme_sources=self._command_meme_sources,
+            lock=self._lock,
+            photo_meme_caption_re=PHOTO_MEME_CAPTION_RE,
+        )
+        self.response_lifecycle = ResponseLifecycle(
+            repository=self.repository,
+            normalize_event=self._normalized_event,
+            take_persona_usage=_take_planned_persona_usage,
+            triggers=self.triggers,
+            media=self.media,
+            persona=self.persona,
+            meme_renderer=self.meme_renderer,
+            mark_command_meme_sent=self.mark_command_meme_sent,
+            remember_policy_identity=self._remember_policy_identity,
+            command_meme_sources=self._command_meme_sources,
+            lock=self._lock,
+        )
+        self.foreground = ForegroundOrchestrator(
+            settings=self.settings,
+            repository=self.repository,
+            normalize_event=self._normalized_event,
+            active_snapshot=self._active_context_snapshot,
+            as_utc=self._as_utc,
+            enabled=self._enabled,
+            context_snapshot=self.context_snapshot,
+            media_context_snapshot=self.media_context_snapshot,
+            create_response_plan=self._create_response_plan,
+            pending_create_action=self._pending_create_action,
+            delivery_type_for_media=self._delivery_type_for_media,
+            provider_for_chat=self.provider_for_chat,
+            provider_available=self.provider_available,
+            generate_llm=self.generate_llm,
+            generate_local=self.generate_local,
+            llm_allowed=self.llm_allowed,
+            troll_mode=self.troll_mode,
+            media_enabled=self.media_enabled,
+            budget_exceeded=self._budget_exceeded,
+            chair_meta_on_cooldown=self._chair_call_meta_joke_on_cooldown,
+            markov_ready=self._markov_ready,
+            message_context=self._message_context,
+            response_planning=self.response_planning,
+            planning_requested=self._planning_requested,
+            deterministic_media_roll=self._deterministic_media_roll,
+            policy_quiet_hours=self._policy_quiet_hours,
+            response_activity=self._response_activity,
+            ensure_action_visible=self._ensure_action_visible,
+            chat_state_analyzer=self.chat_state_analyzer,
+            conversation_policy=self.conversation_policy,
+            direct_router=self.direct_router,
+            local_responder=self.local_responder,
+            media=self.media,
+            memory=self.memory,
+            persona=self.persona,
+            meme_lexicon=self.meme_lexicon,
+            triggers=self.triggers,
+            rng=self.rng,
+            lock=self._lock,
+            clock=self._clock,
+        )
+        self.autonomous = AutonomousCoordinator(
+            settings=self.settings,
+            repository=self.repository,
+            active_snapshot=self._active_context_snapshot,
+            as_utc=self._as_utc,
+            context_snapshot_builder=self.context_snapshot_builder,
+            current_context_snapshot=self.current_context_snapshot,
+            set_context_snapshot=_current_context_snapshot.set,
+            reset_context_snapshot=_current_context_snapshot.reset,
+            response_planning=self.response_planning,
+            response_activity=self._response_activity,
+            delivery_type_for_media=self._delivery_type_for_media,
+            provider_for_chat=self.provider_for_chat,
+            provider_available=self.provider_available,
+            generate_llm=self.generate_llm,
+            enabled=self._enabled,
+            troll_mode=self.troll_mode,
+            autonomous_enabled=self.autonomous_enabled,
+            media_enabled=self.media_enabled,
+            activity_allows=self.activity_allows,
+            media_context_snapshot=self.media_context_snapshot,
+            chat_state_analyzer=self.chat_state_analyzer,
+            autonomous_policy=self.autonomous_policy,
+            media=self.media,
+            memory=self.memory,
+            persona=self.persona,
+            meme_lexicon=self.meme_lexicon,
+            triggers=self.triggers,
+            rng=self.rng,
+            clock=self._clock,
+            last_policy_target_user=self.foreground._last_policy_target_user,
+            policy_answered_messages=self.foreground._policy_answered_messages,
+            last_chat_state=self.foreground._last_chat_state,
+            last_conversation_decision=self.foreground._last_conversation_decision,
+            run_autonomous=self._maybe_autonomous,
+        )
+        self._context_snapshot_metrics = OrderedDict()
         # Optional Telegram-layer UX hook. Core routing remains transport-free.
         self.response_activity = None
-        self._lock = threading.RLock()
 
     def _response_activity(self, chat_id, action="typing", producer=None):
         if self.response_activity is None:
@@ -164,7 +335,10 @@ class LearningService:
         with self._lock:
             if chat_id not in self._repositories:
                 repository = ChatRepository(
-                    self.settings.data_dir, chat_id, self.settings.max_messages_per_chat
+                    self.settings.data_dir,
+                    chat_id,
+                    self.settings.max_messages_per_chat,
+                    self.settings.max_unsummarized_messages,
                 )
                 removed = repository.purge_matching_text(FOREIGN_BOT_COMMAND_RE)
                 removed += repository.purge_matching_text(VOICE_STORY_COMMAND_RE)
@@ -173,10 +347,90 @@ class LearningService:
                 self._repositories[chat_id] = repository
             return self._repositories[chat_id]
 
+    @staticmethod
+    def current_context_snapshot():
+        return _current_context_snapshot.get()
+
+    @staticmethod
+    def _active_context_snapshot(chat_id=None):
+        snapshot = _current_context_snapshot.get()
+        event = current_event()
+        if snapshot is None or event is None or snapshot.event_id != event.event_id:
+            return None
+        if chat_id is not None and snapshot.chat_id != int(chat_id):
+            return None
+        return snapshot
+
+    def context_snapshot(self, message_or_event, current=None):
+        event = self._normalized_event(message_or_event)
+        existing = _current_context_snapshot.get()
+        if existing is not None and existing.event_id == event.event_id:
+            return existing
+        snapshot = self.context_snapshot_builder.build(
+            event, self.repository(event.chat_id), current=current
+        )
+        context = current_event()
+        if context is not None and context.event_id != snapshot.event_id:
+            raise RuntimeError("ContextSnapshot event identity mismatch")
+        _current_context_snapshot.set(snapshot)
+        with self._lock:
+            self._context_snapshot_metrics[snapshot.event_id] = snapshot.metrics
+            while len(self._context_snapshot_metrics) > 500:
+                self._context_snapshot_metrics.popitem(last=False)
+        return snapshot
+
+    def media_context_snapshot(self, snapshot):
+        if snapshot is None or snapshot.media is not None:
+            return snapshot
+        enriched = self.context_snapshot_builder.enrich_media(
+            snapshot, self.repository(snapshot.chat_id)
+        )
+        _current_context_snapshot.set(enriched)
+        with self._lock:
+            self._context_snapshot_metrics[enriched.event_id] = enriched.metrics
+        return enriched
+
+    def context_snapshot_diagnostics(self):
+        with self._lock:
+            values = list(self._context_snapshot_metrics.values())
+        events = len(values)
+        return {
+            "events": events,
+            "avg_db_connections": (
+                sum(item.db_connections for item in values) / events
+                if events else 0.0
+            ),
+            "avg_queries": (
+                sum(item.queries for item in values) / events if events else 0.0
+            ),
+            "avg_build_ms": (
+                sum(item.build_ms for item in values) / events if events else 0.0
+            ),
+            "peak_db_connections": max(
+                (item.db_connections for item in values), default=0
+            ),
+        }
+
+    def format_context_snapshot_diagnostics(self):
+        report = self.context_snapshot_diagnostics()
+        return "\n".join((
+            "CONTEXT SNAPSHOT",
+            f"events: {report['events']}",
+            f"avg_db_connections_after: {report['avg_db_connections']:.2f}",
+            f"avg_queries_after: {report['avg_queries']:.2f}",
+            f"avg_build_ms: {report['avg_build_ms']:.3f}",
+            f"peak_db_connections: {report['peak_db_connections']}",
+        ))
+
+    def _resolved_setting(self, chat_id, key, default=None):
+        snapshot = self._active_context_snapshot(chat_id)
+        if snapshot is not None:
+            return snapshot.setting(key, default)
+        return self.repository(chat_id).setting(key, default)
+
     def activity_percent(self, chat_id):
-        raw = self.repository(chat_id).setting(
-            "activity_percent",
-            str(self.settings.default_activity_percent),
+        raw = self._resolved_setting(
+            chat_id, "activity_percent", str(self.settings.default_activity_percent)
         )
         try:
             value = int(raw)
@@ -197,7 +451,7 @@ class LearningService:
         if not self.settings.enabled:
             return False
         default = "1"
-        return self.repository(chat_id).setting(key, default) == "1"
+        return self._resolved_setting(chat_id, key, default) == "1"
 
     def set_enabled(self, chat_id, kind, enabled):
         if kind not in {"learning", "talk"}:
@@ -205,26 +459,30 @@ class LearningService:
         self.repository(chat_id).set_setting(kind, "1" if enabled else "0")
 
     def troll_mode(self, chat_id):
-        return self.repository(chat_id).setting("troll_mode", "1") == "1"
+        return self._resolved_setting(chat_id, "troll_mode", "1") == "1"
 
     def set_troll_mode(self, chat_id, enabled):
         self.repository(chat_id).set_setting("troll_mode", "1" if enabled else "0")
 
     def autonomous_enabled(self, chat_id):
-        return self.repository(chat_id).setting("autonomous_enabled", "1") == "1"
+        return self._resolved_setting(
+            chat_id, "autonomous_enabled", "1"
+        ) == "1"
 
     def set_autonomous_enabled(self, chat_id, enabled):
         self.repository(chat_id).set_setting("autonomous_enabled", "1" if enabled else "0")
 
     def media_enabled(self, chat_id):
-        return self.repository(chat_id).setting("media_enabled", "1") == "1"
+        return self._resolved_setting(chat_id, "media_enabled", "1") == "1"
 
     def set_media_enabled(self, chat_id, enabled):
         self.repository(chat_id).set_setting("media_enabled", "1" if enabled else "0")
 
     def llm_provider_name(self, chat_id):
         default = self.settings.llm_provider.strip().casefold()
-        value = self.repository(chat_id).setting("llm_provider", default).strip().casefold()
+        value = str(
+            self._resolved_setting(chat_id, "llm_provider", default)
+        ).strip().casefold()
         return value if value in {"grok", "openai"} else default
 
     def provider_for_chat(self, chat_id):
@@ -256,45 +514,105 @@ class LearningService:
         self.repository(chat_id).set_setting("llm_provider", name)
         return True
 
-    def ingest(self, message, refresh_memory=True):
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "learning"):
-            return False, "disabled"
-        user = getattr(message, "from_user", None)
-        if user is None or getattr(user, "is_bot", False):
-            return False, "bot"
-        reason = rejection_reason(message.text, self.settings.max_stored_text_length)
-        if reason:
-            log.debug("Learning message rejected chat=%s reason=%s", chat_id, reason)
-            return False, reason
-        reply = getattr(message, "reply_to_message", None)
-        inserted = self.repository(chat_id).add_message(
-            getattr(message, "message_id", getattr(message, "id", 0)),
-            getattr(user, "id", None),
-            getattr(user, "username", None),
-            normalize_spaces(message.text),
-            datetime.fromtimestamp(getattr(message, "date", 0), timezone.utc) if getattr(message, "date", 0) else None,
-            getattr(reply, "message_id", getattr(reply, "id", None)),
-            reply is not None,
-        )
-        if inserted:
-            self.triggers.note_message(chat_id)
-            self._model_counts.pop(chat_id, None)
-            count = self.repository(chat_id).count()
-            log.info("Learning message accepted chat=%s count=%s", chat_id, count)
-            if count == self.settings.min_training_messages:
-                log.info("Minimum training volume reached chat=%s", chat_id)
-            if refresh_memory:
-                self._maybe_refresh_memory(chat_id)
-        return inserted, None if inserted else "duplicate"
+    @staticmethod
+    def _normalized_event(value):
+        if isinstance(value, NormalizedEvent):
+            return value
+        return normalize_telegram_event(value)
 
-    def _maybe_refresh_memory(self, chat_id):
-        if not self.llm_allowed(chat_id):
-            return False
-        refreshed = self.memory.maybe_refresh(self.repository(chat_id), chat_id)
-        if refreshed:
-            log.info("Memory summary refreshed chat=%s", chat_id)
-        return refreshed
+    @contextmanager
+    def telegram_user_event(self, message_or_event):
+        """Bind minimal R0 correlation/budget state around one Telegram message."""
+        normalized = (
+            message_or_event
+            if isinstance(message_or_event, (NormalizedEvent, NormalizedCallbackEvent))
+            else self._normalized_event(message_or_event)
+        )
+        chat_id = int(normalized.chat_id)
+        event_type = "callback" if isinstance(normalized, NormalizedCallbackEvent) else "user"
+        event = EventContext(normalized.event_id, event_type, chat_id)
+        snapshot_token = _current_context_snapshot.set(None)
+        with bind_event(event):
+            repository = self.repository(chat_id)
+            repository.record_routing_event(
+                "callback_event" if event_type == "callback" else "user_event",
+                event_id=event.event_id,
+            )
+            try:
+                yield event
+            finally:
+                calls = event.permit.call_count
+                if calls > 1:
+                    repository.record_routing_event(
+                        "llm_invariant_violation", event_id=event.event_id
+                    )
+                    log.error(
+                        "LLM_EVENT_INVARIANT_VIOLATION event_id=%s "
+                        "event_type=%s llm_calls=%s",
+                        event.event_id, event_type, calls,
+                    )
+                log.info(
+                    "LLM_EVENT event_id=%s event_type=%s llm_calls=%s "
+                    "denied_calls=%s",
+                    event.event_id, event_type, calls, event.permit.denied_count,
+                )
+                _current_context_snapshot.reset(snapshot_token)
+
+    def chat_event_slot(self, event, *, background=False):
+        """Arbitrate one complete event lifecycle without leaking locks to plans."""
+        return self.concurrency.chat_event_slot(
+            event.chat_id, event.event_id, background=background
+        )
+
+    def autonomous_chat_event_slot(self, chat_id, current):
+        return self.concurrency.chat_event_slot(
+            chat_id, autonomous_event_id(chat_id, current), background=True
+        )
+
+    def media_work_slot(self, chat_id, event_id=None, *, background=False):
+        return self.concurrency.media_slot(
+            event_id or current_event_id() or implicit_event_id("media", chat_id),
+            chat_id,
+            background=background,
+        )
+
+    @contextmanager
+    def response_planning(self):
+        """Ask compatibility routing methods for an immutable final plan."""
+        token = _response_planning.set(True)
+        usage_token = _planned_persona_usage.set(None)
+        snapshot_token = (
+            _current_context_snapshot.set(None)
+            if current_event() is None else None
+        )
+        try:
+            yield
+        finally:
+            if snapshot_token is not None:
+                _current_context_snapshot.reset(snapshot_token)
+            _planned_persona_usage.reset(usage_token)
+            _response_planning.reset(token)
+
+    @staticmethod
+    def _planning_requested(explicit):
+        return bool(explicit or _response_planning.get())
+
+    def ingest(self, message, refresh_memory=True):
+        return self.memory_facade.ingest(message, refresh_memory)
+
+    def ingest_event(self, event, refresh_memory=True):
+        # Keep the historical public seam: callers patching ``ingest`` still
+        # observe normalized-event ingestion through this compatibility API.
+        return self.ingest(event, refresh_memory=refresh_memory)
+
+    def run_memory_maintenance(self, chat_id, current=None):
+        return self.memory_facade.run_memory_maintenance(chat_id, current)
+
+    def persistence_diagnostics(self, chat_id):
+        return self.memory_facade.persistence_diagnostics(chat_id)
+
+    def format_persistence_diagnostics(self, chat_id):
+        return self.memory_facade.format_persistence_diagnostics(chat_id)
 
     def _speaker_name(self, row):
         if row["speaker"] == "cyberchair":
@@ -304,106 +622,21 @@ class LearningService:
         return "Участник"
 
     def status(self, chat_id):
-        repository = self.repository(chat_id)
-        count = repository.count()
-        total = repository.statistics()["total_messages"]
-        return {
-            "count": total,
-            "short_memory_count": count,
-            "ready": count >= self.settings.min_training_messages,
-            "learning": self._enabled(chat_id, "learning"),
-            "talk": self._enabled(chat_id, "talk"),
-            "troll_mode": self.troll_mode(chat_id),
-            "provider": self.llm_provider_name(chat_id),
-            "provider_available": self.provider_available(chat_id),
-            "openai": self.provider_available(chat_id),
-            "activity_percent": self.activity_percent(chat_id),
-            "autonomous_enabled": self.autonomous_enabled(chat_id),
-            "media_enabled": self.media_enabled(chat_id),
-        }
+        return self.memory_facade.status(chat_id)
 
-    def _model_and_messages(self, chat_id):
-        repository = self.repository(chat_id)
-        count = repository.count()
-        with self._lock:
-            if chat_id in self._models and self._model_counts.get(chat_id) == count:
-                model = self._models.pop(chat_id)
-                self._models[chat_id] = model
-            else:
-                messages = self._markov_corpus(repository)
-                model = MarkovModel().train([
-                    (row["text"], row["generation_weight"])
-                    for row in messages
-                ])
-                self._models[chat_id] = model
-                self._model_counts[chat_id] = count
-                while len(self._models) > self.settings.model_cache_size:
-                    old_chat, _ = self._models.popitem(last=False)
-                    self._model_counts.pop(old_chat, None)
-            messages = self._markov_corpus(repository)
-        return model, messages
-
-    def _markov_corpus(self, repository, current=None):
-        """Build an age-tiered corpus without the live edge of the chat."""
-        rows = repository.meme_source_messages()
-        excluded = max(1, int(self.settings.markov_exclude_recent_messages))
-        rows = rows[:-excluded] if len(rows) > excluded else []
-        now = current or datetime.now(timezone.utc)
-        eligible = []
-        for row in rows:
-            created = self._as_utc(row.get("created_at"))
-            if created and (now - created).total_seconds() < self.settings.markov_min_message_age_seconds:
-                continue
-            eligible.append(dict(row))
-
-        recent_size = max(0, int(self.settings.markov_recent_history_size))
-        old_boundary = max(0, len(eligible) - recent_size)
-        for index, row in enumerate(eligible):
-            # Older language is the base corpus. Replied-to/local-meme-like rows
-            # get an extra vote; recently used sources lose that advantage.
-            weight = 3 if index < old_boundary else 1
-            if row.get("reply_count") or row.get("is_reply"):
-                weight += 2
-            if row.get("last_used_at"):
-                weight = max(1, weight - 2)
-            row["generation_weight"] = weight
-        return eligible
-
-    def _valid(self, text, input_text=None, source_texts=(), chat_id=None,
-               max_words=None):
-        return self._validation_result(
-            text, input_text, source_texts, chat_id, max_words
-        )[0]
-
-    def _validation_result(self, text, input_text=None, source_texts=(), chat_id=None,
-                           max_words=None):
-        previous = []
-        if chat_id is not None:
-            since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-            previous = [row["text"] for row in self.repository(chat_id).generated_since(since)]
-        return validate_generated(
-            text, source_texts, input_text, previous,
-            self.settings.min_generated_words,
-            max_words or self.settings.max_generated_words + 8,
-        )
+    def _markov_ready(self, chat_id):
+        return self.generation._markov_ready(chat_id)
 
     def _chair_call_meta_joke_on_cooldown(self, chat_id, text):
-        if not CHAIR_CALL_META_JOKE_RE.search(text or ""):
-            return False
-        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        return any(
-            CHAIR_CALL_META_JOKE_RE.search(row["text"] or "")
-            for row in self.repository(chat_id).generated_since(since)
-        )
+        return self.generation._chair_call_meta_joke_on_cooldown(chat_id, text)
 
     def _message_context(self, message):
-        text = getattr(message, "text", "") or ""
-        reply = getattr(message, "reply_to_message", None)
-        reply_text = normalize_spaces(getattr(reply, "text", "") or "")
+        event = self._normalized_event(message)
+        text = event.effective_text
+        reply_text = normalize_spaces(event.reply_effective_text)
         if reply_text:
             text = f"Сообщение CyberChair, на которое отвечают: {reply_text[:500]}\nОтвет пользователя: {text}"
-        user = getattr(message, "from_user", None)
-        username = (getattr(user, "username", None) or "").casefold()
+        username = (event.username or "").casefold()
         if username == self.settings.creator_username:
             return f"Харакири (@{self.settings.creator_username}): {text}"
         return text
@@ -422,76 +655,90 @@ class LearningService:
         events = self.repository(chat_id).routing_report(since)
         received = events.get("direct_addresses", 0) + events.get("direct_replies", 0)
         # A message that is both a mention and a reply is counted once as a reply.
-        answered = sum(events.get(f"route_{name}", 0) for name in ("local", "grok", "markov", "gif", "meme", "sticker"))
+        llm_routes = events.get("route_llm", 0) + events.get("route_grok", 0)
+        answered = llm_routes + sum(
+            events.get(f"route_{name}", 0)
+            for name in ("local", "markov", "gif", "meme", "sticker")
+        )
         llm = self.llm_cost_diagnostics(chat_id, hours)["total"]
         return {
             "received": received,
             "answered": answered,
             "response_rate": 1.0 if received == 0 else min(1.0, answered / received),
-            "routes": {name: events.get(f"route_{name}", 0) for name in ("local", "grok", "markov", "gif", "meme", "sticker")},
+            "routes": {
+                **{
+                    name: events.get(f"route_{name}", 0)
+                    for name in ("local", "markov", "gif", "meme", "sticker")
+                },
+                "llm": llm_routes,
+            },
             "intents": {name: events.get(f"intent_{name}", 0) for name in ("trivial", "social", "substantive")},
-            "grok_fallback_local": events.get("grok_fallback_local", 0),
-            "grok_share": 0.0 if not answered else events.get("route_grok", 0) / answered,
+            "llm_fallback_local": (
+                events.get("llm_fallback_local", 0)
+                + events.get("grok_fallback_local", 0)
+            ),
+            "llm_share": 0.0 if not answered else llm_routes / answered,
             "cost_usd_ticks": llm.get("cost_usd_ticks"),
         }
 
-    def generate_local(self, chat_id, input_text=None, decorate=True):
-        state = self.status(chat_id)
-        if not state["ready"]:
-            return None
-        model, messages = self._model_and_messages(chat_id)
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        previous = [row["text"] for row in self.repository(chat_id).generated_since(since)]
-        result, mode = self.local.create(model, messages, input_text, previous)
-        if not result:
-            log.info("Local generation failed chat=%s", chat_id)
-            return None
-        closest_sources = sorted(
-            (row["text"] for row in messages),
-            key=lambda source: similarity(result, source),
-            reverse=True,
-        )[:2]
-        self.repository(chat_id).mark_used(closest_sources)
-        log.info("Generation mode selected chat=%s mode=%s", chat_id, mode)
-        return result
+    def quality_diagnostics(self, chat_id, hours=24, current=None):
+        return self.generation.quality_diagnostics(chat_id, hours, current)
 
-    def openai_allowed(self, chat_id):
-        allowed_chat = self.settings.openai_chat_id
-        return allowed_chat is not None and int(chat_id) == int(allowed_chat)
+    def generate_local(
+        self, chat_id, input_text=None, decorate=True, return_sources=False
+    ):
+        return self.generation.generate_local(chat_id, input_text, decorate, return_sources)
 
     def llm_allowed(self, chat_id):
-        return self.openai_allowed(chat_id)
+        return self.generation.llm_allowed(chat_id)
 
     def _record_llm_usage(self, chat_id, provider, model, call_type, usage):
-        self.repository(chat_id).record_llm_call(provider, model, call_type, usage)
+        return self.generation._record_llm_usage(chat_id, provider, model, call_type, usage)
 
     def llm_cost_diagnostics(self, chat_id, hours=24, current=None):
+        return self.generation.llm_cost_diagnostics(chat_id, hours, current)
+
+    def llm_event_invariant_diagnostics(self, chat_id, hours=24, current=None):
         current = current or datetime.now(timezone.utc)
         since = (current - timedelta(hours=hours)).astimezone(timezone.utc).isoformat()
-        return self.repository(chat_id).llm_usage_report(since)
+        return self.repository(chat_id).llm_event_invariant_report(since)
 
-    def _context_budget(self, purpose, context, chat_state):
-        if purpose == "voice_story":
-            return 0, 0
-        if purpose == "autonomous":
-            return self.settings.autonomous_context_message_limit, 2600
-        conversation_type = getattr(chat_state, "conversation_type", "")
-        complex_turn = conversation_type in {"serious", "work", "argument"} and (
-            bool(context and "?" in context) or len(context or "") > 260
-        )
-        if complex_turn:
-            return self.settings.complex_context_message_limit, 5000
-        if context:
-            return self.settings.targeted_context_message_limit, 3200
-        return self.settings.reply_context_message_limit, 2600
+    def format_llm_event_invariant_diagnostics(self, chat_id, hours=24,
+                                               current=None):
+        report = self.llm_event_invariant_diagnostics(chat_id, hours, current)
+        return "\n".join((
+            "LLM EVENT INVARIANT",
+            f"user_events: {report['user_events']}",
+            f"events_with_0_llm: {report['events_with_0_llm']}",
+            f"events_with_1_llm: {report['events_with_1_llm']}",
+            f"events_with_2plus_llm: {report['events_with_2plus_llm']}",
+            f"max_calls_per_user_event: {report['max_calls_per_user_event']}",
+        ))
 
-    def _dialogue_context(self, chat_id, context=None, max_chars=5000,
-                          max_messages=None, chat_state=None):
-        return self.memory.short_term_context(
-            self.repository(chat_id), context, max_chars, max_messages,
-            getattr(chat_state, "dominant_topic", None),
-            getattr(chat_state, "conversation_type", None),
-        )
+    def memory_lifecycle_diagnostics(self, chat_id, current=None):
+        return self.memory_facade.memory_lifecycle_diagnostics(chat_id, current)
+
+    def format_memory_lifecycle_diagnostics(self, chat_id, current=None):
+        return self.memory_facade.format_memory_lifecycle_diagnostics(chat_id, current)
+
+    def concurrency_diagnostics(self):
+        return self.concurrency.snapshot()
+
+    def format_concurrency_diagnostics(self):
+        report = self.concurrency_diagnostics()
+        return "\n".join((
+            "CONCURRENCY HARDENING",
+            f"LLM_MAX_CONCURRENCY={report['llm_max_concurrency']}",
+            f"MEDIA_MAX_CONCURRENCY={report['media_max_concurrency']}",
+            f"peak_active_llm_after={report.get('peak_active_llm_calls', 0)}",
+            f"peak_active_media_after={report.get('peak_active_media_jobs', 0)}",
+            f"llm_admission_timeouts={report['llm_admission_timeouts']}",
+            f"media_admission_timeouts={report['media_admission_timeouts']}",
+            f"chat_gate_wait_p50={report['chat_gate_wait_ms_p50']:.3f}",
+            f"chat_gate_wait_max={report['chat_gate_wait_ms_max']:.3f}",
+            "autonomous_resource_skips="
+            f"{report['autonomous_skipped_chat_busy'] + report['autonomous_skipped_llm_busy'] + report['autonomous_skipped_media_busy']}",
+        ))
 
     def generate_llm(
         self,
@@ -501,701 +748,222 @@ class LearningService:
         conversation_decision=None,
         chat_state=None,
     ):
-        if not self.llm_allowed(chat_id):
-            return SUBSCRIPTION_REQUIRED
-        if context and rejection_reason(context, self.settings.max_stored_text_length):
-            return None
-        safety_identifier = hashlib.sha256(
-            f"cyberchair-chat:{chat_id}".encode("utf-8")
-        ).hexdigest()[:32]
-        repository = self.repository(chat_id)
-        day_summary = repository.summary_for_day(self.memory.logical_day())
-        context_limit, context_chars = self._context_budget(
-            purpose, context, chat_state
-        )
-        selection = self.persona.build_request(
-            chat_id=chat_id,
-            context=context,
-            purpose=purpose,
-            safety_identifier=safety_identifier,
-            history=(
-                None
-                if purpose == "voice_story"
-                else self._dialogue_context(
-                    chat_id, context, context_chars, context_limit, chat_state
-                )
-            ),
-            conversation_decision=conversation_decision,
-            chat_state=chat_state,
-            troll_mode=self.troll_mode(chat_id),
-            day_summary=day_summary,
-            stable_memory=self.memory.relevant_memory(
-                repository, context, getattr(chat_state, "dominant_topic", None),
-                getattr(chat_state, "conversation_type", None),
-            )["stable_chat_memory"],
-        )
-        provider_name = "injected" if self._injected_provider is not None else self.llm_provider_name(chat_id)
-        result = self.provider_for_chat(chat_id).generate(selection.request)
-        # Useful direct answers commonly need more than the old 45-word cap;
-        # the provider token limit and this 70-word ceiling still keep them brief.
-        max_words = 70 if purpose in {"voice_story", "reply", "question"} else 18 if purpose == "creator" else 45
-        if not result:
-            log.info(
-                "LLM_RESULT chat_id=%s provider=%s success=false accepted=false "
-                "fallback_reason=provider_empty_or_error producer_after_fallback=local",
-                chat_id, provider_name,
-            )
-            return None
-        if purpose == "creator" and result:
-            opening = normalize_spaces(result).casefold()
-            if opening.startswith(("харакири", "создатель", "опять")):
-                log.info("Creator reply blocked because of a repetitive opening chat=%s", chat_id)
-                log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=creator_repetitive_opening producer_after_fallback=local", chat_id, provider_name)
-                return None
-        if result and self._chair_call_meta_joke_on_cooldown(chat_id, result):
-            log.info("Repeated chair-call meta joke blocked chat=%s", chat_id)
-            log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=chair_call_cooldown producer_after_fallback=local", chat_id, provider_name)
-            return None
-        if result and looks_like_provider_refusal(result):
-            log.info("Provider refusal routed to local fallback chat=%s", chat_id)
-            log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=provider_refusal producer_after_fallback=local", chat_id, provider_name)
-            return None
-        accepted, validation_reason = self._validation_result(
-            result, context, chat_id=chat_id, max_words=max_words,
-        )
-        if accepted:
-            self.persona.record_usage(
-                chat_id, selection.meme_ids, selection.cooldown_groups
-            )
-            log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=true fallback_reason=none", chat_id, provider_name)
-            return result
-        log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=validation_reject validation_reject=%s producer_after_fallback=local", chat_id, provider_name, validation_reason)
-        return None
-
-    def generate_openai(
-        self,
-        chat_id,
-        context=None,
-        purpose="reply",
-        conversation_decision=None,
-        chat_state=None,
-    ):
-        """Backward-compatible entry point for the configured LLM provider."""
-        return self.generate_llm(
-            chat_id, context, purpose, conversation_decision, chat_state
-        )
+        self.generation.llm_allowed_check = self.llm_allowed
+        return self.generation.generate_llm(chat_id, context, purpose, conversation_decision, chat_state)
 
     def _policy_quiet_hours(self):
-        hour = datetime.now(self.memory._timezone).hour
-        if self.settings.quiet_start_hour > self.settings.quiet_end_hour:
-            return hour >= self.settings.quiet_start_hour or hour < self.settings.quiet_end_hour
-        return self.settings.quiet_start_hour <= hour < self.settings.quiet_end_hour
+        self._sync_foreground_runtime_ports()
+        return self.foreground._policy_quiet_hours()
 
     def conversation_diagnostics(self, chat_id):
-        state = self._last_chat_state.get(chat_id)
-        decision = self._last_conversation_decision.get(chat_id)
-        return {
-            "state": state.debug() if state else None,
-            "decision": decision.debug() if decision else None,
-        }
+        self._sync_foreground_runtime_ports()
+        return self.foreground.conversation_diagnostics(chat_id)
 
     def autonomous_diagnostics(self, chat_id):
-        """Internal state for tests/logging; intentionally not a Telegram command."""
-        decision = self._last_autonomous_decision.get(chat_id)
-        return decision.debug() if decision else None
+        return self.autonomous.autonomous_diagnostics(chat_id)
 
     def _remember_policy_target(self, chat_id, message):
-        actual_user = getattr(getattr(message, "from_user", None), "id", None)
-        actual_message = getattr(message, "message_id", getattr(message, "id", None))
-        if actual_user is not None:
-            self._last_policy_target_user[chat_id] = actual_user
-            previous_user, previous_count = self._policy_target_streak.get(
-                chat_id, (None, 0)
-            )
-            self._policy_target_streak[chat_id] = (
-                actual_user,
-                previous_count + 1 if previous_user == actual_user else 1,
-            )
-        if actual_message is not None:
-            answered = self._policy_answered_messages.setdefault(chat_id, [])
-            answered.append(actual_message)
-            del answered[:-20]
+        self._sync_foreground_runtime_ports()
+        return self.foreground._remember_policy_target(chat_id, message)
 
-    @staticmethod
-    def _deterministic_media_roll(chat_id, message_id, salt):
-        digest = hashlib.sha256(
-            f"{chat_id}:{message_id}:{salt}".encode("utf-8")
-        ).digest()
-        return int.from_bytes(digest[:8], "big") / 2**64
+    def _remember_policy_identity(self, chat_id, actual_user, actual_message):
+        self._sync_foreground_runtime_ports()
+        return self.foreground._remember_policy_identity(chat_id, actual_user, actual_message)
 
-    def _record_direct_result(self, chat_id, message, producer, result,
-                              behavior_mode="useful_answer"):
-        repository = self.repository(chat_id)
-        route = result.action if isinstance(result, MediaDecision) else producer
-        if route == "ai":
-            route = "grok"
-        repository.record_routing_event(f"route_{route}")
-        repository.record_generated(
-            (result.template_id or result.asset_id or "media")
-            if isinstance(result, MediaDecision) else result,
-            f"direct_{route}",
+    def _delivery_type_for_media(self, decision):
+        return self.response_lifecycle._delivery_type_for_media(decision)
+
+    def _pending_create_action(self, event, response, intent):
+        return self.response_lifecycle._pending_create_action(event, response, intent)
+
+    def _create_response_plan(
+        self, event, result, producer, purpose, *, behavior_mode=None,
+        required=False, actions=(), provider_key=None, cleanup_paths=(),
+    ):
+        return self.response_lifecycle._create_response_plan(event, result, producer, purpose, behavior_mode=behavior_mode, required=required, actions=actions, provider_key=provider_key, cleanup_paths=cleanup_paths)
+
+    def prepare_text_response(
+        self, event, text, purpose="adapter", *, producer=Producer.LOCAL,
+        required=False, actions=(), behavior_mode=None, provider_key=None,
+    ):
+        return self.response_lifecycle.prepare_text_response(event, text, purpose, producer=producer, required=required, actions=actions, behavior_mode=behavior_mode, provider_key=provider_key)
+
+    def prepare_manual_meme_response(
+        self, event, decision, prepared_path, cleanup_paths=(),
+    ):
+        return self.response_lifecycle.prepare_manual_meme_response(event, decision, prepared_path, cleanup_paths)
+
+    def discard_command_meme_candidate(self, decision):
+        return self.response_lifecycle.discard_command_meme_candidate(decision)
+
+    def record_delivery_attempt(self, plan):
+        return self.response_lifecycle.record_delivery_attempt(plan)
+
+    def commit_response(self, plan, receipt):
+        self._sync_response_lifecycle_ports()
+        return self.response_lifecycle.commit_response(plan, receipt)
+
+    def abort_response(self, plan, receipt):
+        self._sync_response_lifecycle_ports()
+        return self.response_lifecycle.abort_response(plan, receipt)
+
+    def finalize_response(self, plan, receipt):
+        self._sync_response_lifecycle_ports()
+        return self.response_lifecycle.finalize_response(plan, receipt)
+
+    def _sync_response_lifecycle_ports(self):
+        self.response_lifecycle.bind_runtime_ports(
+            mark_command_meme_sent=self.mark_command_meme_sent,
+            remember_policy_identity=self._remember_policy_identity,
         )
-        self._remember_policy_target(chat_id, message)
-        if isinstance(result, str) and behavior_mode != "troll_user":
-            self._store_pending_from_response(message, result, "substantive")
-        return result
+
+    def _sync_foreground_runtime_ports(self):
+        self.foreground.bind_runtime_ports(
+            repository=self.repository,
+            _normalized_event=self._normalized_event,
+            _active_context_snapshot=self._active_context_snapshot,
+            _as_utc=self._as_utc,
+            _enabled=self._enabled,
+            context_snapshot=self.context_snapshot,
+            media_context_snapshot=self.media_context_snapshot,
+            _create_response_plan=self._create_response_plan,
+            _pending_create_action=self._pending_create_action,
+            _delivery_type_for_media=self._delivery_type_for_media,
+            provider_for_chat=self.provider_for_chat,
+            provider_available=self.provider_available,
+            generate_llm=self.generate_llm,
+            generate_local=self.generate_local,
+            llm_allowed=self.llm_allowed,
+            troll_mode=self.troll_mode,
+            media_enabled=self.media_enabled,
+            _budget_exceeded=self._budget_exceeded,
+            _chair_call_meta_joke_on_cooldown=self._chair_call_meta_joke_on_cooldown,
+            _markov_ready=self._markov_ready,
+            _message_context=self._message_context,
+            response_planning=self.response_planning,
+            _planning_requested=self._planning_requested,
+            deterministic_media_roll=self._deterministic_media_roll,
+            policy_quiet_hours=self._policy_quiet_hours,
+            _response_activity=self._response_activity,
+            _ensure_action_visible=self._ensure_action_visible,
+            chat_state_analyzer=self.chat_state_analyzer,
+            conversation_policy=self.conversation_policy,
+            direct_router=self.direct_router,
+            local_responder=self.local_responder,
+            media=self.media,
+            memory=self.memory,
+            persona=self.persona,
+            meme_lexicon=self.meme_lexicon,
+            triggers=self.triggers,
+            rng=self.rng,
+        )
+
+    def _sync_autonomous_runtime_ports(self):
+        self.autonomous.bind_runtime_ports(
+            repository=self.repository,
+            _active_context_snapshot=self._active_context_snapshot,
+            _as_utc=self._as_utc,
+            context_snapshot_builder=self.context_snapshot_builder,
+            current_context_snapshot=self.current_context_snapshot,
+            set_context_snapshot=_current_context_snapshot.set,
+            reset_context_snapshot=_current_context_snapshot.reset,
+            response_planning=self.response_planning,
+            _response_activity=self._response_activity,
+            _delivery_type_for_media=self._delivery_type_for_media,
+            provider_for_chat=self.provider_for_chat,
+            provider_available=self.provider_available,
+            generate_llm=self.generate_llm,
+            _enabled=self._enabled,
+            troll_mode=self.troll_mode,
+            autonomous_enabled=self.autonomous_enabled,
+            media_enabled=self.media_enabled,
+            activity_allows=self.activity_allows,
+            media_context_snapshot=self.media_context_snapshot,
+            chat_state_analyzer=self.chat_state_analyzer,
+            autonomous_policy=self.autonomous_policy,
+            media=self.media,
+            memory=self.memory,
+            persona=self.persona,
+            meme_lexicon=self.meme_lexicon,
+            triggers=self.triggers,
+            rng=self.rng,
+            run_autonomous=self._maybe_autonomous,
+        )
+
+    def _deterministic_media_roll(self, chat_id, message_id, salt):
+        self._sync_foreground_runtime_ports()
+        return self.foreground._deterministic_media_roll(chat_id, message_id, salt)
+
+    def _record_direct_result(
+        self, chat_id, message, producer, result,
+        behavior_mode="useful_answer", *, as_plan=False,
+        pending_finalize_user_id=None, persona_usage=None, source_usage=(),
+    ):
+        self._sync_foreground_runtime_ports()
+        return self.foreground._record_direct_result(chat_id, message, producer, result, behavior_mode, as_plan=as_plan, pending_finalize_user_id=pending_finalize_user_id, persona_usage=persona_usage, source_usage=source_usage)
 
     def _substantive_behavior_mode(self, chat_id):
-        """Choose once, locally, before selecting the single response producer."""
-        if not self.troll_mode(chat_id):
-            return "useful_answer"
-        probability = max(0.0, min(1.0, float(self.settings.troll_user_probability)))
-        return "troll_user" if self.rng.random() < probability else "useful_answer"
+        self._sync_foreground_runtime_ports()
+        return self.foreground._substantive_behavior_mode(chat_id)
 
     def _store_pending_from_response(self, message, response, intent):
-        clarification = extract_clarification(response)
-        user_id = getattr(getattr(message, "from_user", None), "id", None)
-        if clarification is None or user_id is None:
-            return False
-        expected_type = expected_answer_type(clarification)
-        # A model may ask a generic choice question after any answer. It must
-        # never turn a how-to/factual turn into a hard choice dialogue.
-        if expected_type == "choices" and not is_ambiguous_choice_request(
-            getattr(message, "text", "") or ""
-        ):
-            return False
-        self.repository(message.chat.id).save_pending_conversation(
-            user_id=user_id,
-            original_message_id=getattr(message, "message_id", getattr(message, "id", None)),
-            original_question=normalize_spaces(getattr(message, "text", "") or ""),
-            clarification_question=clarification,
-            intent=intent,
-            context=normalize_spaces(response),
-            expected_type=expected_type,
-            pending_mode=pending_mode(response, clarification),
-        )
-        return True
+        self._sync_foreground_runtime_ports()
+        return self.foreground._store_pending_from_response(message, response, intent)
 
     def pending_conversation(self, chat_id, user_id, current=None):
-        row = self.repository(chat_id).pending_conversation(
-            user_id, self.settings.pending_conversation_ttl_seconds, current,
-        )
-        if not row:
-            return None
-        created = self._as_utc(row["created_at"])
-        return PendingConversation(
-            chat_id=row["chat_id"], user_id=row["user_id"],
-            bot_message_id=row["bot_message_id"],
-            original_message_id=row["original_message_id"],
-            original_question=row["original_question"],
-            clarification_question=row["clarification_question"],
-            intent=row["intent"], context=row["context"],
-            expected_type=row["expected_type"], mode=row["pending_mode"],
-            created_at=created,
-        )
+        self._sync_foreground_runtime_ports()
+        return self.foreground.pending_conversation(chat_id, user_id, current)
 
     def attach_pending_bot_message(self, incoming_message, sent_message):
-        user_id = getattr(getattr(incoming_message, "from_user", None), "id", None)
-        bot_message_id = getattr(sent_message, "message_id", getattr(sent_message, "id", None))
-        if user_id is None or not isinstance(bot_message_id, int):
-            return False
-        self.repository(incoming_message.chat.id).attach_pending_bot_message(
-            user_id, bot_message_id
-        )
-        return True
+        self._sync_foreground_runtime_ports()
+        return self.foreground.attach_pending_bot_message(incoming_message, sent_message)
 
     def is_pending_continuation(self, message, bot_id=None, current=None):
-        user_id = getattr(getattr(message, "from_user", None), "id", None)
-        if user_id is None:
-            return False
-        pending = self.pending_conversation(message.chat.id, user_id, current)
-        if pending is None:
-            return False
-        reply = getattr(message, "reply_to_message", None)
-        reply_id = getattr(reply, "message_id", getattr(reply, "id", None))
-        reply_user = getattr(reply, "from_user", None)
-        strong_reply = bool(
-            reply
-            and (
-                pending.bot_message_id is not None
-                and reply_id == pending.bot_message_id
-                or bot_id is not None
-                and reply_user is not None
-                and getattr(reply_user, "id", None) == bot_id
-            )
-        )
-        return strong_reply or looks_like_continuation(
-            getattr(message, "text", ""), pending.expected_type, pending.mode
-        )
+        self._sync_foreground_runtime_ports()
+        return self.foreground.is_pending_continuation(message, bot_id, current)
 
-    def _local_continuation_fallback(self, pending, answer):
-        if pending.expected_type == "measurements":
-            numbers = [float(value.replace(",", ".")) for value in re.findall(r"\d+(?:[.,]\d+)?", answer)]
-            if len(numbers) >= 2:
-                height, weight = numbers[0], numbers[1]
-                if height > 3:
-                    height /= 100
-                bmi = weight / max(.5, height) ** 2
-                return (
-                    f"при этих данных имт около {bmi:.1f}; стартуй с +250–350 ккал к поддержанию и 110–135 г белка, две недели без роста — докинь ещё 150–200 ккал"
-                )
-        if pending.expected_type == "budget":
-            return f"с бюджетом {normalize_spaces(answer)} уже можно резать варианты по реальной цене; бери лучший по главному сценарию, а не по маркетинговым мегапикселям"
-        if pending.expected_type == "choices":
-            alternatives = extract_choice_alternatives(answer)
-            if len(alternatives) >= 2:
-                return f"между {alternatives[0]} и {alternatives[1]} сначала сравни главный сценарий, цену и что бесит ежедневно; без этого выбор будет чистым глейзингом бренда"
-            return "варианты не извлеклись — не буду придумывать выбор из воздуха"
-        return f"принял: {normalize_spaces(answer)}. теперь по исходной теме уже можно отвечать без гадания; chairOS контекст не проебал"
+    def maybe_pending_continuation(
+        self, message, bot_id=None, current=None, _as_plan=False
+    ):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_pending_continuation(message, bot_id, current, _as_plan)
 
-    def maybe_pending_continuation(self, message, bot_id=None, current=None):
-        """Consume one fresh same-user pending turn and produce exactly one reply."""
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk"):
-            return None
-        user_id = getattr(getattr(message, "from_user", None), "id", None)
-        pending = self.pending_conversation(chat_id, user_id, current) if user_id is not None else None
-        if pending and pending.expected_type == "choices" and choice_declined(
-            getattr(message, "text", "") or ""
-        ):
-            self.repository(chat_id).clear_pending_conversation(user_id)
-            return None
-        if pending is None or not self.is_pending_continuation(message, bot_id, current):
-            return None
-        repository = self.repository(chat_id)
-        repository.clear_pending_conversation(user_id)
-        repository.record_routing_event("pending_continuations")
-        repository.record_routing_event("intent_substantive")
-        state = self.chat_state_analyzer.analyze(
-            repository, incoming_message=message, bot_id=bot_id,
-            last_target_user_id=self._last_policy_target_user.get(chat_id),
-            answered_message_ids=self._policy_answered_messages.get(chat_id, ()),
-        )
-        conversation = self.conversation_policy.decide(
-            state, addressed=True, local_allowed=True,
-            llm_allowed=self.llm_allowed(chat_id), quiet_hours=False,
-        )
-        self._last_chat_state[chat_id] = state
-        self._last_conversation_decision[chat_id] = conversation
-        answer = normalize_spaces(getattr(message, "text", "") or "")
-        context = (
-            "Продолжение разговора.\n"
-            f"Исходный вопрос пользователя: {pending.original_question[:500]}\n"
-            f"Предыдущий ответ CyberChair: {pending.context[:500]}\n"
-            f"CyberChair запросил: {pending.clarification_question[:180]}\n"
-            f"Новая информация пользователя: {answer[:500]}\n"
-            "Продолжи исходную тему и обязательно ответь по существу; не спрашивай, что означает новая информация."
-        )
-        with self._response_activity(chat_id, "typing", "grok") as action:
-            result = None
-            if self.llm_allowed(chat_id) and self.provider_available(chat_id):
-                result = self.generate_openai(
-                    chat_id, context, "reply",
-                    conversation_decision=conversation, chat_state=state,
-                )
-            if result:
-                return self._record_direct_result(chat_id, message, "grok", result)
-            repository.record_routing_event("grok_fallback_local")
-            result = self._local_continuation_fallback(pending, answer)
-            self._ensure_action_visible(action, "local", result)
-            return self._record_direct_result(chat_id, message, "local", result)
+    def prepare_pending_continuation(self, event, bot_id=None, current=None):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.prepare_pending_continuation(event, bot_id, current)
 
-    def maybe_direct_reply(self, message, bot_id=None, bot_username=None,
-                           explicit_address=False):
-        """Return exactly one final producer result for an explicit address/reply."""
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk"):
-            return None
-        user_id = getattr(getattr(message, "from_user", None), "id", None)
-        if user_id is not None:
-            if self.is_pending_continuation(message, bot_id=bot_id):
-                return self.maybe_pending_continuation(message, bot_id=bot_id)
-            # An explicit new turn supersedes stale conversational ambiguity.
-            self.repository(chat_id).clear_pending_conversation(user_id)
-        text = message.text or ""
-        reply = getattr(message, "reply_to_message", None)
-        reply_user = getattr(reply, "from_user", None)
-        direct_reply = bool(reply_user and bot_id and reply_user.id == bot_id)
-        mentioned = bool(bot_username and f"@{bot_username}".casefold() in text.casefold())
-        special = any(phrase in text.casefold() for phrase in self.settings.special_phrases)
-        if not (explicit_address or direct_reply or mentioned or special):
-            return None
+    def maybe_direct_reply(
+        self, message, bot_id=None, bot_username=None,
+        explicit_address=False, _as_plan=False,
+    ):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_direct_reply(message, bot_id, bot_username, explicit_address, _as_plan)
 
-        repository = self.repository(chat_id)
-        repository.record_routing_event(
-            "direct_replies" if direct_reply else "direct_addresses"
-        )
-        subject = text
-        if explicit_address or special:
-            subject = self.persona._strip_chair_invocation(subject)
-        if mentioned and bot_username:
-            subject = re.sub(
-                rf"@{re.escape(bot_username)}\b", "", subject, flags=re.I
-            ).strip()
+    def prepare_direct_reply(
+        self, event, bot_id=None, bot_username=None, explicit_address=False
+    ):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.prepare_direct_reply(event, bot_id, bot_username, explicit_address)
 
-        state = self.chat_state_analyzer.analyze(
-            repository,
-            incoming_message=message,
-            bot_id=bot_id,
-            last_target_user_id=self._last_policy_target_user.get(chat_id),
-            answered_message_ids=self._policy_answered_messages.get(chat_id, ()),
-        )
-        ai_available = self.llm_allowed(chat_id) and self.provider_available(chat_id)
-        budget_exceeded = self._budget_exceeded(chat_id)
-        social_ai_useful = (
-            direct_reply
-            and len(subject.split()) >= 8
-            and state.conversation_type in {"serious", "work"}
-        )
-        route = self.direct_router.decide(
-            subject,
-            direct_reply=direct_reply,
-            ai_available=ai_available,
-            budget_exceeded=budget_exceeded,
-            social_ai_useful=social_ai_useful,
-        )
-        detected_intent = (
-            question_intent(subject)
-            if route.intent == SUBSTANTIVE else route.intent
-        )
-        behavior_mode = (
-            self._substantive_behavior_mode(chat_id)
-            if route.intent == SUBSTANTIVE else "chat"
-        )
-        log.info(
-            "DIRECT_ROUTE chat_id=%s intent=%s substantive=%s mode=%s priority=%s producer=%s reason=%s",
-            chat_id, detected_intent, route.intent == SUBSTANTIVE,
-            behavior_mode, route.priority, route.producer, route.reason,
-        )
-        repository.record_routing_event(f"intent_{route.intent}")
-        self._last_direct_decision[chat_id] = route
+    def maybe_reply(
+        self, message, bot_id=None, bot_username=None, _as_plan=False
+    ):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_reply(message, bot_id, bot_username, _as_plan)
 
-        conversation = self.conversation_policy.decide(
-            state,
-            addressed=True,
-            local_allowed=route.producer != "grok",
-            llm_allowed=route.producer == "grok",
-            quiet_hours=False,
-        )
-        self._last_chat_state[chat_id] = state
-        self._last_conversation_decision[chat_id] = conversation
+    def prepare_reply(self, event, bot_id=None, bot_username=None):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.prepare_reply(event, bot_id, bot_username)
 
-        # Contextual media is a free final response only for non-substantive
-        # turns. A meme decision is skipped here because rendering failure must
-        # not consume the guaranteed direct reply.
-        if route.intent != SUBSTANTIVE and self.media_enabled(chat_id):
-            day_summary = repository.summary_for_day(self.memory.logical_day()) or {}
-            callbacks = self.persona.select_callbacks(
-                day_summary, repository.stable_memories(20), subject,
-                state.dominant_topic,
-            )
-            selected_memes = self.meme_lexicon.select(
-                subject, {state.conversation_type, conversation.preferred_style},
-                conversation.troll_intensity, limit=1,
-            )
-            media = self.media.decide(
-                chat_id, repository, conversation, state,
-                self.memory.short_term_rows(repository), subject,
-                selected_memes, callbacks, self.troll_mode(chat_id),
-                self._deterministic_media_roll(chat_id, getattr(message, "message_id", 0), "direct_media"),
-                self._deterministic_media_roll(chat_id, getattr(message, "message_id", 0), "direct_meme"),
-                self._deterministic_media_roll(chat_id, getattr(message, "message_id", 0), "direct_reaction"),
-            )
-            if media.action in {"gif", "sticker"}:
-                self.media.commit(repository, media)
-                return self._record_direct_result(chat_id, message, media.action, media)
-
-        markov_selected = (
-            route.producer != "grok"
-            and route.intent == SOCIAL
-            and self.status(chat_id)["ready"]
-            and self.rng.random() < max(0.0, min(1.0, self.settings.direct_social_markov_share))
-        )
-        selected_producer = "grok" if route.producer == "grok" else (
-            "markov" if markov_selected else "local"
-        )
-        with self._response_activity(chat_id, "typing", selected_producer) as action:
-            if route.producer == "grok":
-                result = self.generate_openai(
-                    chat_id, self._message_context(message),
-                    "troll_user" if behavior_mode == "troll_user" else "reply",
-                    conversation_decision=conversation, chat_state=state,
-                )
-                if result:
-                    return self._record_direct_result(
-                        chat_id, message, "grok", result, behavior_mode
-                    )
-                repository.record_routing_event("grok_fallback_local")
-
-            # Markov is an occasional SOCIAL producer and is selected before
-            # generation, never next to a successful AI/media response.
-            if markov_selected:
-                result = self.generate_local(chat_id, subject)
-                if result and not self._chair_call_meta_joke_on_cooldown(chat_id, result):
-                    self._ensure_action_visible(action, "markov", result)
-                    return self._record_direct_result(chat_id, message, "markov", result)
-
-            result, memes = self.local_responder.respond(
-                chat_id, subject, route.intent, repository,
-                self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
-                self.troll_mode(chat_id),
-                conversation.troll_intensity,
-                behavior_mode,
-            )
-            if memes:
-                self.persona.record_usage(
-                    chat_id,
-                    tuple(item.id for item in memes),
-                    tuple(item.cooldown_group for item in memes),
-                )
-            self._ensure_action_visible(action, "local", result)
-            return self._record_direct_result(
-                chat_id, message, "local", result, behavior_mode
-            )
-
-    def maybe_reply(self, message, bot_id=None, bot_username=None):
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk"):
-            return None
-        text = message.text or ""
-        reply = getattr(message, "reply_to_message", None)
-        reply_user = getattr(reply, "from_user", None)
-        replies_to_bot = bool(reply_user and bot_id and reply_user.id == bot_id)
-        mentioned = bool(bot_username and f"@{bot_username}".casefold() in text.casefold())
-        special = any(phrase in text.casefold() for phrase in self.settings.special_phrases)
-        addressed = replies_to_bot or mentioned or special
-        if addressed:
-            return self.maybe_direct_reply(
-                message, bot_id=bot_id, bot_username=bot_username,
-                explicit_address=False,
-            )
-        if not self.troll_mode(chat_id) and not addressed:
-            return None
-        state = self.chat_state_analyzer.analyze(
-            self.repository(chat_id),
-            incoming_message=message,
-            bot_id=bot_id,
-            last_target_user_id=self._last_policy_target_user.get(chat_id),
-            answered_message_ids=self._policy_answered_messages.get(chat_id, ()),
-        )
-        local_allowed = (
-            False if addressed else self.triggers.allowed(chat_id, "random")
-        )
-        llm_kind = "addressed" if addressed else "openai_random"
-        llm_allowed = self.triggers.allowed(chat_id, llm_kind, addressed=addressed)
-        incoming_user_id = getattr(getattr(message, "from_user", None), "id", None)
-        streak_user, streak_count = self._policy_target_streak.get(chat_id, (None, 0))
-        if (
-            not addressed
-            and incoming_user_id is not None
-            and incoming_user_id == streak_user
-            and streak_count >= 2
-        ):
-            local_allowed = False
-            llm_allowed = False
-        decision = self.conversation_policy.decide(
-            state,
-            addressed=addressed,
-            local_allowed=local_allowed,
-            llm_allowed=llm_allowed,
-            quiet_hours=self._policy_quiet_hours(),
-        )
-        self._last_chat_state[chat_id] = state
-        self._last_conversation_decision[chat_id] = decision
-        if decision.action == "none":
-            return None
-        roll = self.rng.random()
-        if roll >= decision.reply_probability:
-            return None
-        if addressed:
-            kind = "addressed"
-        elif roll < decision.local_probability:
-            kind = "random"
-        else:
-            kind = "openai_random"
-        repository = self.repository(chat_id)
-        day_summary = repository.summary_for_day(self.memory.logical_day()) or {}
-        callbacks = self.persona.select_callbacks(
-            day_summary,
-            repository.stable_memories(20),
-            text,
-            state.dominant_topic,
-        )
-        selected_memes = self.meme_lexicon.select(
-            text,
-            {state.conversation_type, decision.preferred_style},
-            decision.troll_intensity,
-            limit=3,
-        )
-        media_decision = MediaDecision(reason="media_disabled")
-        if self.media_enabled(chat_id):
-            media_decision = self.media.decide(
-                chat_id=chat_id,
-                repository=repository,
-                conversation_decision=decision,
-                chat_state=state,
-                short_term_rows=self.memory.short_term_rows(repository),
-                target_text=text,
-                selected_memes=selected_memes,
-                local_callbacks=callbacks,
-                troll_mode=self.troll_mode(chat_id),
-                probability_roll=self._deterministic_media_roll(
-                    chat_id,
-                    getattr(message, "message_id", getattr(message, "id", 0)),
-                    "media",
-                ),
-                meme_roll=self._deterministic_media_roll(
-                    chat_id,
-                    getattr(message, "message_id", getattr(message, "id", 0)),
-                    "meme",
-                ),
-                reaction_roll=self._deterministic_media_roll(
-                    chat_id,
-                    getattr(message, "message_id", getattr(message, "id", 0)),
-                    "reaction",
-                ),
-            )
-        if media_decision.action != "none":
-            self.triggers.commit(chat_id, kind)
-            self.media.commit(repository, media_decision)
-            repository.record_generated(
-                media_decision.template_id or media_decision.asset_id or "media",
-                "contextual_media",
-            )
-            self._remember_policy_target(chat_id, message)
-            log.info(
-                "Delivery selected chat=%s event=reply action=%s reason=%s",
-                chat_id, media_decision.action, media_decision.reason,
-            )
-            return media_decision
-        # Addressed replies use the selected provider. Ordinary random replies
-        # may still use the existing local generator.
-        provider = "grok" if kind in {"addressed", "openai_random"} else "markov"
-        with self._response_activity(chat_id, "typing", provider) as action:
-            if provider == "grok":
-                purpose = "reply" if kind == "addressed" else "random_reply"
-                result = self.generate_openai(
-                    chat_id,
-                    self._message_context(message),
-                    purpose,
-                    conversation_decision=decision,
-                    chat_state=state,
-                )
-            else:
-                result = self.generate_local(chat_id, text)
-            if result:
-                self._ensure_action_visible(action, provider, result)
-        if result:
-            self.triggers.commit(chat_id, kind)
-            self.repository(chat_id).record_generated(result, kind)
-            self._remember_policy_target(chat_id, message)
-            log.info(
-                "Generated reply ready chat=%s trigger=%s generation_path=%s delivery=text",
-                chat_id,
-                kind,
-                provider,
-            )
-        return result
-
-    def maybe_special_ai(self, message, kind, chance, purpose, addressed=True):
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk") or not self.troll_mode(chat_id):
-            return None
-        if not self.triggers.allowed(chat_id, kind, addressed=addressed):
-            return None
-        if self.rng.random() >= chance:
-            return None
-        with self._response_activity(chat_id, "typing", "grok"):
-            result = self.generate_openai(
-                chat_id, self._message_context(message), purpose
-            )
-        if result:
-            self.triggers.commit(chat_id, kind)
-            self.repository(chat_id).record_generated(result, kind)
-        return result
+    def maybe_special_ai(
+        self, message, kind, chance, purpose, addressed=True, _as_plan=False
+    ):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_special_ai(message, kind, chance, purpose, addressed, _as_plan)
 
     def maybe_stul_cooldown_reply(self, message):
-        """Choose exactly one provider for a repeated chair trigger."""
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk") or not self.troll_mode(chat_id):
-            return None
-        if not self.triggers.allowed(chat_id, "stul_cooldown", addressed=True):
-            return None
-
-        # “стул” is an address, never the subject by itself.  A call that also
-        # contains a real topic must reach the contextual model even if it has
-        # no question mark; otherwise rapid calls degrade into Markov jokes
-        # about the invocation rather than answering the chat.
-        subject = self.persona._strip_chair_invocation(message.text)
-        subject_words = {
-            word for word in significant_words(subject)
-            if word not in {"еще", "ещё", "раз", "снова", "опять", "второй"}
-        }
-        if subject_words:
-            result = self.generate_openai(
-                chat_id,
-                self._message_context(message),
-                "reply",
-            )
-            provider = "ai"
-            if result:
-                self.triggers.commit(chat_id, "stul_cooldown")
-                self.repository(chat_id).record_generated(result, "stul_cooldown")
-                log.info(
-                    "Contextual chair call answered chat=%s generation_path=%s delivery=text",
-                    chat_id,
-                    provider,
-                )
-            return result
-
-        frequency = self.triggers.note_chair(chat_id)
-        roll = self.rng.random()
-        ai_chance = self.settings.reply_to_stul_chance
-        markov_chance = self.settings.stul_markov_reply_chance
-        invocation = normalize_spaces(message.text).casefold().strip(".,!?…")
-        is_bare_invocation = invocation in {"стул", "стульчик"}
-        factor = self.settings.bare_stul_reply_factor if is_bare_invocation else 1.0
-        total = min(1.0, (ai_chance + markov_chance) * factor)
-        if roll >= total:
-            return None
-
-        provider_roll = roll / total if total else 1.0
-        if frequency >= 2:
-            provider = (
-                "markov"
-                if provider_roll < self.settings.frequent_stul_markov_chance
-                else "ai"
-            )
-        elif is_bare_invocation:
-            # When a rare bare call is accepted, prefer the coherent path; the
-            # occurrence probability itself is already sharply reduced.
-            provider = "ai" if provider_roll < .8 else "markov"
-        else:
-            provider = "ai" if provider_roll < ai_chance / (ai_chance + markov_chance) else "markov"
-
-        if provider == "ai":
-            result = self.generate_openai(
-                chat_id,
-                self._message_context(message),
-                "stul_cooldown",
-            )
-            provider = "ai"
-        else:
-            result = self.generate_local(chat_id, message.text)
-            provider = "markov"
-
-        if result:
-            if self._chair_call_meta_joke_on_cooldown(chat_id, result):
-                log.info("Repeated chair-call meta joke blocked chat=%s", chat_id)
-                return None
-            self.triggers.commit(chat_id, "stul_cooldown")
-            self.repository(chat_id).record_generated(result, "stul_cooldown")
-            log.info(
-                "Repeated chair trigger answered chat=%s generation_path=%s delivery=text",
-                chat_id,
-                provider,
-            )
-        return result
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_stul_cooldown_reply(message)
 
     def stul_cooldown_remaining(self, chat_id):
         return self.triggers.cooldown_remaining(
@@ -1214,41 +982,11 @@ class LearningService:
     def note_stul(self, chat_id):
         return self.triggers.note_chair(chat_id)
 
-    def maybe_question_reply(self, message):
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk"):
-            return None
-        if not self.triggers.allowed(chat_id, "chair_question", addressed=True):
-            return None
-        with self._response_activity(chat_id, "typing", "grok"):
-            result = self.generate_openai(
-                chat_id,
-                self._message_context(message),
-                "question",
-            )
-        if result:
-            self.triggers.commit(chat_id, "chair_question")
-            self.repository(chat_id).record_generated(result, "chair_question")
-        return result
+    def maybe_voice_story(self, message, _as_plan=False):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_voice_story(message, _as_plan)
 
-    def maybe_voice_story(self, message):
-        chat_id = message.chat.id
-        if not self._enabled(chat_id, "talk") or not self.troll_mode(chat_id):
-            return None
-        since = (
-            datetime.now(timezone.utc)
-            - timedelta(seconds=self.settings.voice_story_cooldown)
-        ).isoformat()
-        if self.repository(chat_id).generated_since(since, "voice_story"):
-            return None
-        # The invocation is a control command, not story context or memory.
-        with self._response_activity(chat_id, "typing", "grok"):
-            result = self.generate_openai(chat_id, None, "voice_story")
-        if result:
-            self.repository(chat_id).record_generated(result, "voice_story")
-        return result
-
-    def voice_story_cooldown_remaining(self, chat_id):
+    def _voice_story_cooldown_remaining(self, chat_id):
         since = (
             datetime.now(timezone.utc)
             - timedelta(seconds=self.settings.voice_story_cooldown)
@@ -1265,549 +1003,129 @@ class LearningService:
 
     def take_voice_story_cooldown_notice(self, chat_id):
         """Return remaining voice cooldown at most once per minute per chat."""
-        remaining = self.voice_story_cooldown_remaining(chat_id)
+        remaining = self._voice_story_cooldown_remaining(chat_id)
         if remaining <= 0:
             return 0
         now = self._clock()
         with self._lock:
-            last_notice = self._voice_cooldown_notices.get(chat_id)
+            last_notice = self.foreground._voice_cooldown_notices.get(chat_id)
             if last_notice is not None and now - last_notice < 60:
                 return 0
-            self._voice_cooldown_notices[chat_id] = now
+            self.foreground._voice_cooldown_notices[chat_id] = now
         return remaining
 
+    def release_voice_story_cooldown_notice(self, chat_id):
+        """Rollback a transient notice claim when Telegram delivery failed."""
+        with self._lock:
+            self.foreground._voice_cooldown_notices.pop(chat_id, None)
+
     def claim_scheduled_event(self, chat_id, event_key):
+        """Deprecated identity-only compatibility seam; not production delivery."""
         return self.repository(chat_id).claim_scheduled_event(event_key)
 
-    def maybe_sglypa_reply(self, message):
-        chat_id = message.chat.id
-        if not self.troll_mode(chat_id):
-            return None
-        if self.rng.random() >= self.settings.sglypa_reply_chance:
-            return None
-        if not self.triggers.allowed(chat_id, "sglypa", addressed=True):
-            return None
-        with self._response_activity(chat_id, "typing", "grok"):
-            result = self.generate_openai(chat_id, message.text, "sglypa")
-        if not result:
-            return None
-        self.triggers.commit(chat_id, "sglypa")
-        self.repository(chat_id).record_generated(result, "sglypa")
-        return result
+    def deliver_scheduled_event(
+        self, chat_id, event_key, event_kind, scheduled_at, payload, sender,
+        parse_mode=None, current=None,
+    ):
+        spec = ScheduledEventSpec(
+            event_key=str(event_key),
+            event_kind=str(event_kind),
+            scheduled_at=scheduled_at,
+            payload=str(payload),
+            parse_mode=parse_mode,
+        )
+        return self.scheduled_delivery.deliver_event(
+            chat_id, spec, sender, current=current
+        )
 
-    @staticmethod
-    def _as_utc(value):
-        if not value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(value)
-        except (TypeError, ValueError):
-            return None
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    def deliver_pending_scheduled_events(
+        self, chat_id, sender, current=None, limit=10,
+    ):
+        return self.scheduled_delivery.deliver_pending(
+            chat_id, sender, current=current, limit=limit
+        )
 
-    def maybe_autonomous(self, chat_id, current, is_workday=True):
-        """Return one local-policy-selected text/media action, or ``None``.
+    def scheduled_delivery_diagnostics(self, chat_id, current=None):
+        return self.scheduled_delivery.diagnostics(chat_id, current)
 
-        The policy is deterministic/local.  The provider is called only after
-        a roll actually selects a textual autonomous intervention.
-        """
-        if (
-            not self._enabled(chat_id, "talk")
-            or not self.troll_mode(chat_id)
-            or not self.autonomous_enabled(chat_id)
-        ):
-            return None
-        if not is_workday and not self.settings.autonomous_on_weekends:
-            return None
-        repository = self.repository(chat_id)
-        utc_current = current.replace(tzinfo=timezone.utc) if current.tzinfo is None else current.astimezone(timezone.utc)
-        quiet = self._quiet_hours_at(current)
-        state = self.chat_state_analyzer.analyze(
-            repository,
-            last_target_user_id=self._last_policy_target_user.get(chat_id),
-            answered_message_ids=self._policy_answered_messages.get(chat_id, ()),
-            now=utc_current,
-        )
-        day = self.memory.logical_day(current)
-        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
-        latest_bot = self._as_utc((repository.latest_generated() or {}).get("created_at"))
-        latest_auto = self._as_utc((repository.latest_generated(("autonomous", "autonomous_media")) or {}).get("created_at"))
-        latest_message = repository.recent_messages(1)
-        latest_human = self._as_utc(latest_message[-1]["created_at"]) if latest_message else None
-        prior_start = (utc_current - timedelta(hours=3)).isoformat()
-        autonomous_count = sum(
-            1 for row in repository.generated_since(day_start)
-            if row["kind"] in {"autonomous", "autonomous_media"}
-        )
-        autonomous = self.autonomous_policy.decide(
-            state,
-            current=utc_current,
-            summary=repository.summary_for_day(day) or {},
-            prior_activity=repository.recent_activity_count(prior_start),
-            last_bot_at=latest_bot,
-            last_autonomous_at=latest_auto,
-            last_human_at=latest_human,
-            daily_count=autonomous_count,
-            quiet_hours=quiet,
-            troll_mode=True,
-        )
-        self._last_autonomous_decision[chat_id] = autonomous
-        self._last_chat_state[chat_id] = state
-        self._last_conversation_decision[chat_id] = autonomous.conversation_decision
-        if autonomous.action == "none" or self.rng.random() >= autonomous.probability:
-            return None
-        # The existing activity setting and generic trigger remain hard gates.
-        if not self.activity_allows(chat_id) or not self.triggers.allowed(chat_id, "autonomous"):
-            return None
-        decision = autonomous.conversation_decision
-        rows = self.memory.short_term_rows(repository)
-        target = next((row for row in rows if row.get("message_id") == decision.target_message_id), None)
-        target_text = (target or {}).get("text", "")
-        summary = repository.summary_for_day(day) or {}
-        callbacks = self.persona.select_callbacks(
-            summary, repository.stable_memories(20), target_text, state.dominant_topic
-        )
-        selected_memes = self.meme_lexicon.select(
-            target_text or state.dominant_topic or "",
-            {state.conversation_type, decision.preferred_style},
-            decision.troll_intensity,
-            limit=3,
-        )
-        media = MediaDecision(reason="media_disabled")
-        if self.media_enabled(chat_id):
-            media = self.media.decide(
-                chat_id, repository, decision, state, rows, target_text,
-                selected_memes, callbacks, troll_mode=True,
-            )
-        if media.action != "none":
-            self.triggers.commit(chat_id, "autonomous")
-            self.media.commit(repository, media)
-            repository.record_generated(
-                media.template_id or media.asset_id or "media", "autonomous_media", utc_current
-            )
-            log.info(
-                "Delivery selected chat=%s event=autonomous action=%s reason=%s",
-                chat_id, media.action, media.reason,
-            )
-            return media
-        if not self.provider_available(chat_id):
-            return None
-        with self._response_activity(chat_id, "typing", "grok"):
-            result = self.generate_openai(
-                chat_id, target_text or None, "autonomous", decision, state
-            )
-        if not result:
-            return None
-        self.triggers.commit(chat_id, "autonomous")
-        repository.record_generated(result, "autonomous", utc_current)
-        log.info(
-            "Generated reply ready chat=%s trigger=autonomous generation_path=ai delivery=text",
-            chat_id,
-        )
-        return result
+    def format_scheduled_delivery_diagnostics(self, chat_id, current=None):
+        return self.scheduled_delivery.format_diagnostics(chat_id, current)
+
+    def maybe_sglypa_reply(self, message, _as_plan=False):
+        self._sync_foreground_runtime_ports()
+        return self.foreground.maybe_sglypa_reply(message, _as_plan)
+
+    def _as_utc(self, value):
+        return self.generation._as_utc(value)
+
+    def prepare_autonomous(self, chat_id, current, is_workday=True):
+        self._sync_autonomous_runtime_ports()
+        return self.autonomous.prepare_autonomous(chat_id, current, is_workday)
+
+    def _maybe_autonomous(
+        self, chat_id, current, is_workday=True, _as_plan=False
+    ):
+        self._sync_autonomous_runtime_ports()
+        return self.autonomous._maybe_autonomous(chat_id, current, is_workday, _as_plan)
 
     def _quiet_hours_at(self, current):
-        hour = current.hour
-        if self.settings.quiet_start_hour > self.settings.quiet_end_hour:
-            return hour >= self.settings.quiet_start_hour or hour < self.settings.quiet_end_hour
-        return self.settings.quiet_start_hour <= hour < self.settings.quiet_end_hour
+        return self.autonomous._quiet_hours_at(current)
 
     def ingest_gif(self, message):
-        if not self.settings.gif_enabled:
-            return False
-        user = getattr(message, "from_user", None)
-        if not user or getattr(user, "is_bot", False):
-            return False
-        animation = getattr(message, "animation", None)
-        document = getattr(message, "document", None)
-        media = animation or document
-        if not media or not getattr(media, "file_id", None):
-            return False
-        inserted = self.repository(message.chat.id).add_gif(
-            getattr(message, "message_id", getattr(message, "id", 0)),
-            getattr(user, "id", None),
-            media.file_id,
-            getattr(media, "file_unique_id", media.file_id),
-            datetime.fromtimestamp(getattr(message, "date", 0), timezone.utc)
-            if getattr(message, "date", 0) else None,
-            self.settings.max_gifs_per_chat,
-        )
-        if inserted:
-            log.info("GIF accepted chat=%s count=%s", message.chat.id, self.repository(message.chat.id).gif_count())
-        return inserted
+        return self.media_coordinator.ingest_gif(message)
 
     def ingest_sticker(self, message):
-        if not self.settings.sticker_enabled:
-            return False
-        user = getattr(message, "from_user", None)
-        sticker = getattr(message, "sticker", None)
-        if not user or getattr(user, "is_bot", False) or not sticker:
-            return False
-        inserted = self.repository(message.chat.id).add_sticker(
-            getattr(message, "message_id", getattr(message, "id", 0)),
-            getattr(user, "id", None),
-            sticker.file_id,
-            getattr(sticker, "file_unique_id", sticker.file_id),
-            datetime.fromtimestamp(getattr(message, "date", 0), timezone.utc)
-            if getattr(message, "date", 0) else None,
-            self.settings.max_stickers_per_chat,
-        )
-        if inserted:
-            log.info(
-                "Sticker accepted chat=%s count=%s",
-                message.chat.id,
-                self.repository(message.chat.id).sticker_count(),
-            )
-        return inserted
+        return self.media_coordinator.ingest_sticker(message)
 
-    @staticmethod
-    def telegram_image_metadata(message):
-        """Extract the largest Telegram photo or a safe image document."""
-        if message is None:
-            return None
-        user = getattr(message, "from_user", None)
-        from_bot = bool(user and getattr(user, "is_bot", False))
-        photos = list(getattr(message, "photo", None) or ())
-        if photos:
-            media = max(
-                photos,
-                key=lambda item: (
-                    int(getattr(item, "width", 0) or 0)
-                    * int(getattr(item, "height", 0) or 0),
-                    int(getattr(item, "file_size", 0) or 0),
-                ),
-            )
-            media_type, mime_type = "photo", "image/jpeg"
-        else:
-            media = getattr(message, "document", None)
-            mime_type = str(getattr(media, "mime_type", "") or "").casefold()
-            if not media or mime_type not in SAFE_CHAT_IMAGE_MIME_TYPES:
-                return None
-            media_type = "document"
-        file_id = getattr(media, "file_id", None)
-        if not file_id:
-            return None
-        return {
-            "message_id": getattr(message, "message_id", getattr(message, "id", 0)),
-            "user_id": getattr(user, "id", None),
-            "file_id": file_id,
-            "file_unique_id": getattr(media, "file_unique_id", file_id),
-            "media_type": media_type,
-            "mime_type": mime_type,
-            "caption": normalize_spaces(getattr(message, "caption", "") or ""),
-            "file_size": getattr(media, "file_size", None),
-            "width": getattr(media, "width", None),
-            "height": getattr(media, "height", None),
-            "from_bot": from_bot,
-            "created_at": (
-                datetime.fromtimestamp(getattr(message, "date", 0), timezone.utc)
-                if getattr(message, "date", 0) else None
-            ),
-        }
+    def telegram_image_metadata(self, message):
+        return self.media_coordinator.telegram_image_metadata(message)
 
     def ingest_chat_image(self, message):
-        metadata = self.telegram_image_metadata(message)
-        if not metadata:
-            return False
-        inserted = self.repository(message.chat.id).add_chat_image(
-            **metadata, max_images=self.settings.max_chat_images_per_chat
-        )
-        if inserted:
-            log.info(
-                "Chat image metadata accepted chat=%s message=%s from_bot=%s",
-                message.chat.id, metadata["message_id"], metadata["from_bot"],
-            )
-        return inserted
+        return self.media_coordinator.ingest_chat_image(message)
 
-    def maybe_random_media(self, chat_id):
-        if (
-            not self.troll_mode(chat_id)
-            or not self.media_enabled(chat_id)
-            or (not self.settings.gif_enabled and not self.settings.sticker_enabled)
-            or not self.activity_allows(chat_id)
-            or self.rng.random() >= self.settings.gif_post_chance
-        ):
-            return None
-        repository = self.repository(chat_id)
-        since = (datetime.now(timezone.utc) - timedelta(seconds=self.settings.gif_post_cooldown)).isoformat()
-        if repository.generated_since(since, "random_media"):
-            return None
-        decision = self.media.random_fallback(repository)
-        if decision.action == "none":
-            return None
-        repository.mark_media_file_used(decision.action, decision.asset_id)
-        self.media.commit(repository, decision)
-        repository.record_generated(decision.asset_id, "random_media")
-        media_type = "animation" if decision.action == "gif" else "sticker"
-        log.info("Random media selected chat=%s type=%s", chat_id, media_type)
-        return media_type, decision.asset_id
-
-    def render_meme(self, decision, source_path=None):
-        if not isinstance(decision, MediaDecision) or decision.action != "meme":
-            return None
-        if source_path is not None and decision.background_file_id:
-            return self.meme_renderer.render_image(
-                source_path,
-                decision.caption_text,
-                decision.render_profile or "top_caption",
-                max_bytes=self.settings.max_chat_image_bytes,
-                max_dimension=self.settings.max_chat_image_dimension,
-                max_pixels=self.settings.max_chat_image_pixels,
-            )
-        return self.meme_renderer.render(decision.template_id, decision.caption_text)
+    def render_meme(self, decision, source_path=None, *, background=None):
+        return self.media_coordinator.render_meme(decision, source_path, background=background)
 
     def startup_meme(self, chat_id=None):
-        """Return the one-time meme reserved for the next successful restart."""
-        chat_id = self.settings.openai_chat_id if chat_id is None else chat_id
-        if chat_id is None or not self.troll_mode(chat_id) or not self.media_enabled(chat_id):
-            return None
-        repository = self.repository(chat_id)
-        if repository.setting("startup_meme_v1", "0") == "1":
-            return None
-        asset = self.media_catalog.get("t800_chud")
-        if not asset or not self.media_catalog.resolve(asset):
-            return None
-        return MediaDecision(
-            action="meme", asset_id=asset.id, template_id=asset.id,
-            caption_text="chairOS online: мемная подсистема активирована",
-            confidence=1.0, reason="startup_meme_v1",
-            asset_key=asset.id, cooldown_group=asset.cooldown_group,
-            archetype=asset.archetype,
-        )
+        return self.media_coordinator.startup_meme(chat_id)
 
     def mark_startup_meme_sent(self, decision, chat_id=None):
-        chat_id = self.settings.openai_chat_id if chat_id is None else chat_id
-        if chat_id is None or not isinstance(decision, MediaDecision):
-            return
-        repository = self.repository(chat_id)
-        self.media.commit(repository, decision)
-        repository.record_generated(decision.template_id or "startup_meme", "startup_meme")
-        repository.set_setting("startup_meme_v1", "1")
+        return self.media_coordinator.mark_startup_meme_sent(decision, chat_id)
 
     def meme_command_on_cooldown(self, chat_id):
-        """Whether the *AI caption* path is cooling down, not the command."""
-        since = (
-            datetime.now(timezone.utc)
-            - timedelta(seconds=self.settings.manual_meme_cooldown)
-        ).isoformat()
-        return bool(self.repository(chat_id).generated_since(since, "manual_meme"))
-
-    def _curated_command_background(self, recent_templates=()):
-        candidates = [
-            asset for asset in self.media_catalog.assets
-            if asset.type == "meme_template" and self.media_catalog.resolve(asset)
-        ]
-        if not candidates:
-            return None
-        unused = [asset for asset in candidates if asset.id not in recent_templates]
-        return self.rng.choice(unused or candidates)
-
-    def _command_background_decision(self, decision, asset):
-        if not asset:
-            return None
-        values = decision.debug()
-        values.update({
-            "asset_id": asset.id,
-            "template_id": asset.id,
-            "asset_key": asset.id,
-            "cooldown_group": asset.cooldown_group,
-            "archetype": asset.archetype,
-            "background_file_id": None,
-            "background_file_unique_id": None,
-            "background_media_type": None,
-            "background_mime_type": None,
-            "background_user_id": None,
-            "background_message_id": None,
-            "background_explicit": False,
-            "render_profile": None,
-        })
-        return MediaDecision(**values)
+        return self.media_coordinator.meme_command_on_cooldown(chat_id)
 
     def fallback_command_meme_background(self, decision, chat_id):
-        """Choose a curated template only after a chat image failed validation."""
-        asset = self._curated_command_background(
-            self.meme_sources.recent_templates(chat_id)
-        )
-        fallback = self._command_background_decision(decision, asset)
-        if fallback is not None and decision in self._command_meme_sources:
-            self._command_meme_sources[fallback] = self._command_meme_sources.pop(decision)
-        return fallback
+        return self.media_coordinator.fallback_command_meme_background(decision, chat_id)
 
     def maybe_command_meme(self, chat_or_message, hint=""):
-        """Always make a meme; AI cooldown only switches its caption source."""
-        message = chat_or_message if hasattr(chat_or_message, "chat") else None
-        chat_id = message.chat.id if message is not None else int(chat_or_message)
-        if not self.media_enabled(chat_id):
-            return None
-        repository = self.repository(chat_id)
-        reply = getattr(message, "reply_to_message", None) if message is not None else None
-        explicit_image = self.telegram_image_metadata(reply)
-        if explicit_image:
-            # Preserve metadata even when an old update was missed. Bot media is
-            # stored for audit/regression purposes but is never selectable.
-            repository.add_chat_image(
-                **explicit_image, max_images=self.settings.max_chat_images_per_chat
-            )
-        explicit_usable = bool(
-            explicit_image
-            and not explicit_image["from_bot"]
-            and (explicit_image.get("file_size") or 0) <= self.settings.max_chat_image_bytes
-            and max(explicit_image.get("width") or 0, explicit_image.get("height") or 0)
-                <= self.settings.max_chat_image_dimension
-        )
-        # A reply to a non-image/bot image is an explicit but unusable choice:
-        # safely fall back to curated media rather than substituting an unrelated
-        # image from chat history.
-        force_curated = reply is not None and not explicit_usable
-        hint = normalize_spaces(hint)
-        background_context = normalize_spaces(
-            f"{hint} {(explicit_image or {}).get('caption', '')}"
-        )
-        rows = repository.meme_source_messages()
-        summary = repository.summary_for_day(self.memory.logical_day()) or {}
-        callbacks = self.persona.select_callbacks(
-            summary, repository.stable_memories(20), "", None
-        )
-        ai_ready = (
-            self.troll_mode(chat_id)
-            and self.provider_available(chat_id)
-            and not self.meme_command_on_cooldown(chat_id)
-        )
-        source = self.meme_sources.choose(
-            chat_id, rows, callbacks, current_text=background_context,
-            topic=hint, fallback=not ai_ready
-        )
-        caption = None
-        if ai_ready:
-            context = normalize_spaces(
-                " | ".join(value for value in (
-                    f"Пожелание к мему: {hint}" if hint else "",
-                    f"Подпись исходной картинки: {explicit_image.get('caption')}"
-                    if explicit_image and explicit_image.get("caption") else "",
-                    source.text,
-                ) if value)
-            ) or None
-            caption = self.generate_openai(chat_id, context, "meme_caption")
-            # An event that selected AI never cascades into Markov/local output.
-            if not caption:
-                return None
-        else:
-            source, caption = self._local_command_caption(chat_id, source, rows, callbacks)
-        if not caption:
-            return None
-        base = MediaDecision(
-            action="meme",
-            source_message_id=source.message_id, caption_text=caption, confidence=1.0,
-            reason=f"manual_{'ai' if ai_ready else 'local'}_{source.kind}",
-        )
-        image = explicit_image if explicit_usable else None
-        if image is None and not force_curated:
-            chance = max(0.0, min(1.0, self.settings.chat_image_background_chance))
-            if self.rng.random() < chance:
-                ranked = self.media.score_chat_images(
-                    repository, background_context or source.text,
-                    getattr(getattr(message, "from_user", None), "id", None),
-                )
-                caption_hash = hashlib.sha256(caption.casefold().encode("utf-8")).hexdigest()[:20]
-                image = next((
-                    row for row in ranked
-                    if not repository.chat_image_caption_used(
-                        row["file_unique_id"], caption_hash
-                    )
-                ), None)
-        if image is not None:
-            profile = self.rng.choice(("top_caption", "bottom_caption", "top_bottom"))
-            values = base.debug()
-            values.update({
-                "background_file_id": image["file_id"],
-                "background_file_unique_id": image["file_unique_id"],
-                "background_media_type": image["media_type"],
-                "background_mime_type": image.get("mime_type"),
-                "background_user_id": image.get("user_id"),
-                "background_message_id": image.get("message_id"),
-                "background_explicit": bool(explicit_usable),
-                "render_profile": profile,
-                "asset_key": f"chat_image:{image['file_unique_id']}",
-                "cooldown_group": "chat_image",
-                "archetype": "chat_image",
-            })
-            decision = MediaDecision(**values)
-        else:
-            asset = self._curated_command_background(
-                self.meme_sources.recent_templates(chat_id)
-            )
-            decision = self._command_background_decision(base, asset)
-            if decision is None:
-                return None
-        self._command_meme_sources[decision] = source
-        return decision
+        self._sync_media_runtime_ports()
+        return self.media_coordinator.maybe_command_meme(chat_or_message, hint)
 
-    def _local_command_caption(self, chat_id, source, rows, callbacks):
-        """One ready local fallback; it never chains into another producer."""
-        if source.kind in {"old", "fresh", "callback"} and source.text:
-            return source, self._caption_from_source(source)
-        phrases = (
-            "chairOS фиксирует промышленный скилл ишью",
-            "протокол брейнрота активирован, проект кукд",
-            "лил бро выбрал сайдквест вместо жизни",
-            "сканирование завершено: проект кукд",
+    def _sync_media_runtime_ports(self):
+        self.media_coordinator.bind_runtime_ports(
+            activity_allows=self.activity_allows,
+            media_enabled=self.media_enabled,
+            troll_mode=self.troll_mode,
+            provider_available=self.provider_available,
+            generate_llm=self.generate_llm,
+            generate_local=self.generate_local,
+            meme_cooldown=self.meme_command_on_cooldown,
+            local_caption=self.media_coordinator._local_command_caption,
         )
-        phrase = self.rng.choice(phrases)
-        return MemeSource("phrase", phrase), phrase
-
-    def _caption_from_source(self, source):
-        text = normalize_spaces(source.text)[:110]
-        if source.kind == "callback":
-            return f"{text} — канон ивент"
-        if source.kind == "markov":
-            return f"{text} — пошёл брейнрот"
-        tails = (
-            "канон ивент зафиксирован",
-            "лил бро ларпит сигму",
-            "chairOS фиксирует скилл ишью",
-            "сойджак-комиссия уже выехала",
-        )
-        return f"{text} — {self.rng.choice(tails)}"
 
     def mark_command_meme_sent(self, chat_id, decision):
-        if not isinstance(decision, MediaDecision):
-            return
-        repository = self.repository(chat_id)
-        self.media.commit(repository, decision)
-        repository.record_generated(decision.template_id or "manual_meme", "manual_meme")
-        if decision.background_file_unique_id:
-            caption_hash = hashlib.sha256(
-                (decision.caption_text or "").casefold().encode("utf-8")
-            ).hexdigest()[:20]
-            repository.mark_chat_image_used(
-                decision.background_file_unique_id,
-                caption_hash,
-                decision.background_user_id,
-            )
-        source = self._command_meme_sources.pop(
-            decision,
-            MemeSource((decision.reason or "").rsplit("_", 1)[-1], "", decision.source_message_id),
-        )
-        self.meme_sources.record(
-            chat_id, source, decision.template_id,
-        )
-        if source.kind in {"old", "fresh"} and source.text:
-            repository.mark_used([source.text])
+        return self.media_coordinator.mark_command_meme_sent(chat_id, decision)
 
     def cleanup_rendered_meme(self, result):
-        self.meme_renderer.cleanup(result)
+        return self.media_coordinator.cleanup_rendered_meme(result)
 
     def forget_chat(self, chat_id):
         self.repository(chat_id).clear()
+        self.generation.forget_chat(chat_id)
+        self.foreground.forget_chat(chat_id)
+        self.autonomous.forget_chat(chat_id)
         with self._lock:
-            self._models.pop(chat_id, None)
-            self._model_counts.pop(chat_id, None)
-            self._last_policy_target_user.pop(chat_id, None)
-            self._policy_target_streak.pop(chat_id, None)
-            self._policy_answered_messages.pop(chat_id, None)
-            self._last_chat_state.pop(chat_id, None)
-            self._last_conversation_decision.pop(chat_id, None)
-            self._last_autonomous_decision.pop(chat_id, None)
             self.persona.clear_chat(chat_id)
             self.meme_sources.clear_chat(chat_id)
             self._command_meme_sources.clear()

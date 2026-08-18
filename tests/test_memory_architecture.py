@@ -22,6 +22,11 @@ EMPTY_SUMMARY = {
 }
 
 
+def run_memory_maintenance(service, chat_id=-1):
+    """Use the canonical R5 maintenance API in memory behavior tests."""
+    return service.run_memory_maintenance(chat_id).status == "committed"
+
+
 class SummaryProvider:
     available = True
 
@@ -78,7 +83,7 @@ class MemoryArchitectureTests(unittest.TestCase):
         repository = service.repository(-1)
         self.add(repository, 1, "старое сообщение вне окна", self.now - timedelta(minutes=31))
         self.add(repository, 2, "свежее сообщение внутри окна", self.now - timedelta(minutes=5))
-        context = service._dialogue_context(-1)
+        context = service.generation._dialogue_context(-1)
         self.assertNotIn("старое сообщение вне окна", context)
         self.assertIn("свежее сообщение внутри окна", context)
 
@@ -92,7 +97,7 @@ class MemoryArchitectureTests(unittest.TestCase):
                 f"допустимая релевантная реплика номер {index}",
                 self.now - timedelta(minutes=25 - index),
             )
-        context = service._dialogue_context(-1, "релевантная реплика")
+        context = service.generation._dialogue_context(-1, "релевантная реплика")
         dialogue = context.partition("Последние релевантные реплики:\n")[2]
         self.assertEqual(len(dialogue.splitlines()), 20)
 
@@ -101,9 +106,9 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service(provider)
         repository = service.repository(-1)
         self.add(repository, 1, "первый новый фрагмент")
-        self.assertTrue(service._maybe_refresh_memory(-1))
+        self.assertTrue(run_memory_maintenance(service))
         self.add(repository, 2, "второй отдельный фрагмент")
-        self.assertTrue(service._maybe_refresh_memory(-1))
+        self.assertTrue(run_memory_maintenance(service))
         self.assertIn("первый новый фрагмент", provider.requests[0].input)
         self.assertIn("второй отдельный фрагмент", provider.requests[1].input)
         self.assertNotIn("первый новый фрагмент", provider.requests[1].input)
@@ -113,14 +118,14 @@ class MemoryArchitectureTests(unittest.TestCase):
         repository = service.repository(-1)
         self.add(repository, 1, "сообщение успешно обработано")
         row_id = repository.recent_messages()[0]["id"]
-        self.assertTrue(service._maybe_refresh_memory(-1))
+        self.assertTrue(run_memory_maintenance(service))
         self.assertEqual(repository.summary_state()["last_message_row_id"], row_id)
 
     def test_failed_summary_does_not_advance_cursor(self):
         service, _ = self.service(SummaryProvider([None]))
         repository = service.repository(-1)
         self.add(repository, 1, "сообщение осталось необработанным")
-        self.assertFalse(service._maybe_refresh_memory(-1))
+        self.assertFalse(run_memory_maintenance(service))
         state = repository.summary_state()
         self.assertEqual(state["last_message_row_id"], 0)
         self.assertIsNotNone(state["pending_since"])
@@ -132,9 +137,9 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service(provider)
         repository = service.repository(-1)
         self.add(repository, 1, "обсудили первый релиз")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.add(repository, 2, "обсудили второй релиз")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.assertIn("Предыдущее резюме дня", provider.requests[1].input)
         self.assertIn("первый релиз", provider.requests[1].input)
 
@@ -147,7 +152,7 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service(SummaryProvider([summary]))
         repository = service.repository(-1)
         self.add(repository, 1, "снова спорим о пятничном деплое")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         stored = repository.summary_for_day("2026-08-11")
         self.assertEqual(stored["active_conflicts"], ["спор о релизе"])
         self.assertEqual(stored["callback_jokes"], ["шутка про пятничный деплой"])
@@ -157,7 +162,7 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service()
         repository = service.repository(-1)
         self.add(repository, 1, "сообщение после полуночи по Москве")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.assertIsNotNone(repository.summary_for_day("2026-08-11"))
         self.assertIsNone(repository.summary_for_day("2026-08-10"))
 
@@ -166,7 +171,7 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service(SummaryProvider([summary]))
         repository = service.repository(-1)
         self.add(repository, 1, "Серёга постоянно опаздывает")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.assertEqual(repository.stable_memories(), [])
         self.assertEqual(repository.memory_candidates()[0]["observation_count"], 1)
 
@@ -175,9 +180,9 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service(SummaryProvider([summary, summary]))
         repository = service.repository(-1)
         self.add(repository, 1, "Серёга постоянно опаздывает")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.add(repository, 2, "И снова Серёга постоянно опаздывает")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.assertEqual(repository.stable_memories(), ["Серёга постоянно опаздывает"])
         self.assertEqual(repository.memory_candidates()[0]["observation_count"], 2)
 
@@ -187,9 +192,9 @@ class MemoryArchitectureTests(unittest.TestCase):
         service, _ = self.service(SummaryProvider([first, second]))
         repository = service.repository(-1)
         self.add(repository, 1, "Серёга постоянно опаздывает")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.add(repository, 2, "Серега часто опаздывает!!!")
-        service._maybe_refresh_memory(-1)
+        run_memory_maintenance(service)
         self.assertEqual(len(repository.memory_candidates()), 1)
         self.assertEqual(len(repository.stable_memories()), 1)
 
@@ -254,9 +259,9 @@ class MemoryArchitectureTests(unittest.TestCase):
         )
         repository = service.repository(-1)
         self.add(repository, 1, "одно новое сообщение")
-        self.assertFalse(service._maybe_refresh_memory(-1))
+        self.assertFalse(run_memory_maintenance(service))
         self.now += timedelta(minutes=20)
-        self.assertTrue(service._maybe_refresh_memory(-1))
+        self.assertTrue(run_memory_maintenance(service))
         self.assertEqual(len(provider.requests), 1)
 
 

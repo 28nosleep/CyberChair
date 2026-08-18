@@ -99,7 +99,7 @@ class ConversationPolicy:
             )
         local_chance = self.settings.random_reply_chance * activity_factor * type_factor
         conditional_llm_chance = (
-            self.settings.openai_random_reply_chance * activity_factor * type_factor
+            self.settings.llm_random_reply_chance * activity_factor * type_factor
         )
         local_probability = min(1.0, local_chance) if local_allowed else 0.0
         llm_probability = (

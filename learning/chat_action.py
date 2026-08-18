@@ -38,6 +38,7 @@ class ChatActionManager:
         self.sleeper = sleeper or time.sleep
         self._active = {}
         self._lock = threading.RLock()
+        self._shutdown = threading.Event()
 
     def _send(self, chat_id, action):
         try:
@@ -51,7 +52,7 @@ class ChatActionManager:
             return False
 
     def _refresh(self, chat_id, stop):
-        while not stop.wait(self.refresh_interval):
+        while not self._shutdown.is_set() and not stop.wait(self.refresh_interval):
             with self._lock:
                 active = self._active.get(chat_id)
                 if active is None or active.stop is not stop:
@@ -65,8 +66,13 @@ class ChatActionManager:
         started_at = self.clock()
         owner = False
         with self._lock:
-            active = self._active.get(chat_id)
-            if active is None:
+            if self._shutdown.is_set():
+                yield_disabled = True
+                active = None
+            else:
+                yield_disabled = False
+                active = self._active.get(chat_id)
+            if not yield_disabled and active is None:
                 stop = threading.Event()
                 thread = threading.Thread(
                     target=self._refresh,
@@ -77,10 +83,14 @@ class ChatActionManager:
                 active = _ActiveAction(action, stop, thread)
                 self._active[chat_id] = active
                 owner = True
-            else:
+            elif not yield_disabled:
                 active.references += 1
                 active.action = action
-        self._send(chat_id, action)
+        if yield_disabled:
+            yield ChatActionSession(self, chat_id, started_at)
+            return
+        if not self._shutdown.is_set():
+            self._send(chat_id, action)
         if owner:
             active.thread.start()
         try:
@@ -100,7 +110,7 @@ class ChatActionManager:
 
     def ensure_visible(self, started_at, producer, text):
         """Add only the small local delay still missing after preparation."""
-        if producer == "grok":
+        if producer == "llm" or self._shutdown.is_set():
             return
         words = len(str(text or "").split())
         if producer == "markov":
@@ -122,6 +132,18 @@ class ChatActionManager:
             if chat_id is None:
                 return len(self._active)
             return int(chat_id in self._active)
+
+    def shutdown(self):
+        """Stop refresh API calls without waiting for active foreground work."""
+        self._shutdown.set()
+        with self._lock:
+            active = tuple(self._active.values())
+        for item in active:
+            item.stop.set()
+
+    def worker_count(self):
+        with self._lock:
+            return sum(int(item.thread.is_alive()) for item in self._active.values())
 
 
 MEDIA_CHAT_ACTIONS = {

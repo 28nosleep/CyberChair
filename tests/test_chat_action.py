@@ -111,7 +111,7 @@ class ChatActionTests(unittest.TestCase):
     def test_long_generation_refreshes_typing_and_cleans_up(self):
         events = []
         manager = ChatActionManager(FakeBot(events), refresh_interval=0.03)
-        with manager.activity(-1, "typing", "grok"):
+        with manager.activity(-1, "typing", "llm"):
             time.sleep(0.13)
         self.assertGreaterEqual(len(events), 3)
         self.assertTrue(all(event[2] == "typing" for event in events))

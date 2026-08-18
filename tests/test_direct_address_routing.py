@@ -95,7 +95,7 @@ class DirectAddressRoutingTests(unittest.TestCase):
         result = service.maybe_direct_reply(message("стул"), explicit_address=True)
         self.assertTrue(result)
         self.assertEqual(provider.calls, [])
-        self.assertEqual(service._last_direct_decision[-1].intent, "trivial")
+        self.assertEqual(service.foreground._last_direct_decision[-1].intent, "trivial")
 
     def test_short_summon_is_guaranteed_and_free(self):
         service, provider = self.service()
@@ -108,7 +108,7 @@ class DirectAddressRoutingTests(unittest.TestCase):
         result = service.maybe_direct_reply(message("стул иди нахуй"), explicit_address=True)
         self.assertTrue(result)
         self.assertEqual(provider.calls, [])
-        self.assertEqual(service._last_direct_decision[-1].priority, "P2")
+        self.assertEqual(service.foreground._last_direct_decision[-1].priority, "P2")
 
     def test_substantive_uses_exactly_one_llm_call(self):
         service, provider = self.service()
@@ -117,7 +117,7 @@ class DirectAddressRoutingTests(unittest.TestCase):
         )
         self.assertIn("полезный", result)
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(service._last_direct_decision[-1].priority, "P3")
+        self.assertEqual(service.foreground._last_direct_decision[-1].priority, "P3")
 
     def test_how_to_runtime_pipeline_uses_grok_and_accepts_useful_long_answer(self):
         answer = (
@@ -134,10 +134,10 @@ class DirectAddressRoutingTests(unittest.TestCase):
             )
         self.assertEqual(result, answer)
         self.assertEqual(len(provider.calls), 1)
-        decision = service._last_direct_decision[-1]
+        decision = service.foreground._last_direct_decision[-1]
         self.assertEqual(decision.intent, "substantive")
         self.assertEqual(decision.priority, "P3")
-        self.assertEqual(decision.producer, "grok")
+        self.assertEqual(decision.producer, "llm")
         rendered_logs = "\n".join(logs.output)
         self.assertIn("DIRECT_ROUTE", rendered_logs)
         self.assertIn("intent=how_to", rendered_logs)
@@ -191,7 +191,7 @@ class DirectAddressRoutingTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(len(provider.calls), 1)
         report = service.direct_response_diagnostics(-1)
-        self.assertEqual(report["grok_fallback_local"], 1)
+        self.assertEqual(report["llm_fallback_local"], 1)
         self.assertEqual(report["routes"]["local"], 1)
 
     def test_soft_budget_never_blocks_p1_or_p3(self):

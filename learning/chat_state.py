@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
 from .memory_service import normalize_summary
+from .normalized_event import NormalizedEvent, normalize_telegram_event
 from .repository import normalize_memory
 
 
@@ -85,27 +86,21 @@ class ChatStateAnalyzer:
     def _incoming_row(self, message, now):
         if message is None:
             return None
-        user = getattr(message, "from_user", None)
-        raw_date = getattr(message, "date", None)
-        if isinstance(raw_date, datetime):
-            created_at = raw_date
-        elif isinstance(raw_date, (int, float)) and raw_date > 0:
-            created_at = datetime.fromtimestamp(raw_date, timezone.utc)
-        else:
-            created_at = now
-        reply = getattr(message, "reply_to_message", None)
+        event = (
+            message if isinstance(message, NormalizedEvent)
+            else normalize_telegram_event(message)
+        )
+        created_at = event.timestamp or now
         return {
             "row_id": None,
-            "message_id": getattr(message, "message_id", getattr(message, "id", None)),
-            "user_id": getattr(user, "id", None),
-            "username": getattr(user, "username", None),
-            "text": getattr(message, "text", "") or "",
+            "message_id": event.message_id,
+            "user_id": event.user_id,
+            "username": event.username,
+            "text": event.effective_text,
             "created_at": created_at.isoformat(),
-            "speaker": "cyberchair" if getattr(user, "is_bot", False) else "user",
-            "reply_to_message_id": getattr(
-                reply, "message_id", getattr(reply, "id", None)
-            ),
-            "is_reply": int(reply is not None),
+            "speaker": "cyberchair" if event.user_is_bot else "user",
+            "reply_to_message_id": event.reply_to_message_id,
+            "is_reply": int(event.reply_to_message_id is not None),
         }
 
     def _rows(self, repository, incoming_message, now):
@@ -292,21 +287,43 @@ class ChatStateAnalyzer:
         last_target_user_id=None,
         answered_message_ids=(),
         now=None,
+        snapshot=None,
     ):
         del bot_id  # Bot-authored rows are identified by their stored speaker.
         current = self._now(now)
-        rows = self._rows(repository, incoming_message, current)
-        latest_rows = repository.recent_messages(1)
-        latest_stamp = _stamp(latest_rows[-1]["created_at"]) if latest_rows else None
+        if snapshot is None:
+            rows = self._rows(repository, incoming_message, current)
+            latest_rows = repository.recent_messages(1)
+            latest_stamp = (
+                _stamp(latest_rows[-1]["created_at"]) if latest_rows else None
+            )
+            summary = normalize_summary(
+                repository.summary_for_day(
+                    self.memory_service.logical_day(current)
+                ) or {}
+            )
+        else:
+            rows = list(snapshot.recent_dialogue)
+            incoming = self._incoming_row(incoming_message, current)
+            if incoming and not any(
+                row.get("message_id") == incoming.get("message_id")
+                and row.get("speaker") == incoming.get("speaker")
+                for row in rows
+            ):
+                rows.append(incoming)
+            rows = sorted(
+                rows, key=lambda row: _stamp(row.get("created_at")) or current
+            )
+            latest_stamp = _stamp(
+                snapshot.latest_message.get("created_at")
+            ) if snapshot.latest_message else None
+            summary = normalize_summary(snapshot.current_summary)
         if incoming_message is not None:
             incoming_stamp = _stamp(self._incoming_row(incoming_message, current)["created_at"])
             if incoming_stamp and (latest_stamp is None or incoming_stamp > latest_stamp):
                 latest_stamp = incoming_stamp
         silence = max(0, int((current - latest_stamp).total_seconds())) if latest_stamp else None
         activity = self._activity(rows, silence, current)
-        summary = normalize_summary(
-            repository.summary_for_day(self.memory_service.logical_day(current)) or {}
-        )
         dominant_topic, topic_strength = self._dominant_topic(rows, summary)
         humor, argument, serious, work, reply_density = self._scores(rows)
         conversation_type = self._conversation_type(humor, argument, serious, work)

@@ -42,11 +42,12 @@ def format_direct_report(events, usage_report):
     received = events.get("direct_addresses", 0) + events.get("direct_replies", 0)
     routes = {
         name: events.get(f"route_{name}", 0)
-        for name in ("local", "grok", "gif", "sticker", "markov", "meme")
+        for name in ("local", "gif", "sticker", "markov", "meme")
     }
+    routes["llm"] = events.get("route_llm", 0) + events.get("route_grok", 0)
     answered = sum(routes.values())
     rate = 100.0 if not received else min(100.0, answered * 100 / received)
-    share = 0.0 if not answered else routes["grok"] * 100 / answered
+    share = 0.0 if not answered else routes["llm"] * 100 / answered
     cost = usage_report["total"]["cost_usd_ticks"]
     return "\n".join((
         "DIRECT RESPONSES / 24h",
@@ -54,9 +55,10 @@ def format_direct_report(events, usage_report):
         f"answered: {answered}",
         f"response rate: {rate:.1f}%",
         " | ".join(f"{name}: {count}" for name, count in routes.items()),
-        f"Grok share: {share:.1f}%",
+        f"LLM share: {share:.1f}%",
         f"actual cost: {_cost(cost)}",
-        f"grok fallback local: {events.get('grok_fallback_local', 0)}",
+        "llm fallback local: "
+        f"{events.get('llm_fallback_local', 0) + events.get('grok_fallback_local', 0)}",
     ))
 
 

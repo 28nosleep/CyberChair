@@ -1,5 +1,4 @@
 import re
-from datetime import datetime, timedelta, timezone
 
 from .direct_address import SOCIAL, SUBSTANTIVE
 from .preprocessing import normalize_spaces
@@ -73,11 +72,30 @@ NEUTRAL_RESPONSES = {
 class LocalResponder:
     """Data-driven CyberChair fallback with local anti-repeat and meme cooldowns."""
 
-    def __init__(self, lexicon, rng):
+    def __init__(self, lexicon, rng, lexical_tracker=None):
         self.lexicon = lexicon
         self.rng = rng
+        self.lexical_tracker = lexical_tracker
 
-    def _troll_user(self, text, repository, excluded_meme_ids, excluded_meme_groups):
+    def _choose_variant(self, variants, repository, recent_generated=None):
+        recent = (
+            list(recent_generated)
+            if recent_generated is not None
+            else [row["text"] for row in repository.recent_generated(40)]
+        )
+        fresh = [item for item in variants if item not in recent] or list(variants)
+        if self.lexical_tracker:
+            scored = [(self.lexical_tracker.score(item, recent)[0], index, item)
+                      for index, item in enumerate(fresh)]
+            best = min(item[0] for item in scored)
+            if any(score > best + .25 for score, _, _ in scored):
+                repository.record_routing_event("lexical_penalty_triggered")
+            fresh = [item for score, _, item in scored if score <= best + .25]
+        index = min(len(fresh) - 1, int(self.rng.random() * len(fresh)))
+        return fresh[index]
+
+    def _troll_user(self, text, repository, excluded_meme_ids, excluded_meme_groups,
+                    recent_generated=None, stable_memories=None):
         """A real roast fallback: never turn provider failure into advice."""
         normalized = normalize_spaces(text or "").casefold()
         topic = next((label for pattern, label in (
@@ -94,7 +112,10 @@ class LocalResponder:
         ) if re.search(pattern, normalized)), "этот план")
         callbacks = []
         terms = set(re.findall(r"[а-яёa-z0-9]{4,}", normalized))
-        for item in repository.stable_memories(20):
+        for item in (
+            stable_memories
+            if stable_memories is not None else repository.stable_memories(20)
+        ):
             value = normalize_spaces(str(item))
             if terms & set(re.findall(r"[а-яёa-z0-9]{4,}", value.casefold())):
                 callbacks.append(value[:100])
@@ -112,7 +133,7 @@ class LocalResponder:
                 f"это не вопрос про {topic}, это заявка на то, чтобы взрослый интернет сделал за тебя домашку",
                 f"у тебя с {topic} такой контакт, будто ты открыл меню настроек и сразу начал переговоры с богом",
             ]
-        result = variants[min(len(variants) - 1, int(self.rng.random() * len(variants)))]
+        result = self._choose_variant(variants, repository, recent_generated)
         selected = self.lexicon.select(
             text, {"mocking", "humor"}, .7, excluded_meme_ids,
             excluded_meme_groups, limit=1, recent_concepts=excluded_meme_groups,
@@ -141,9 +162,13 @@ class LocalResponder:
 
     def respond(self, chat_id, text, intent, repository, excluded_meme_ids=(),
                 excluded_meme_groups=(), troll_mode=True, troll_intensity=.6,
-                behavior_mode="useful_answer"):
+                behavior_mode="useful_answer", recent_generated=None,
+                stable_memories=None):
         if intent == SUBSTANTIVE and behavior_mode == "troll_user":
-            return self._troll_user(text, repository, excluded_meme_ids, excluded_meme_groups)
+            return self._troll_user(
+                text, repository, excluded_meme_ids, excluded_meme_groups,
+                recent_generated, stable_memories,
+            )
         category = self._category(text, intent)
         normalized = normalize_spaces(text or "").casefold()
         if intent == SUBSTANTIVE:
@@ -172,12 +197,7 @@ class LocalResponder:
             # Low intensity stays the same character but does not randomly jump
             # to a high-intensity profanity variant.
             variants = [item for item in variants if not PROFANITY_RE.search(item)] or variants
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        recent = [row["text"] for row in repository.generated_since(since)][-12:]
-        fresh = [item for item in variants if item not in recent]
-        candidates = fresh or variants
-        index = min(len(candidates) - 1, int(self.rng.random() * len(candidates)))
-        result = candidates[index]
+        result = self._choose_variant(variants, repository, recent_generated)
 
         # At most one lexicon concept, and only when it naturally fits a social
         # response. Existing lexicon cooldown groups are shared with AI persona.

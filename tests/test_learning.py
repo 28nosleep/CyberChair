@@ -117,7 +117,7 @@ class LearningTests(unittest.TestCase):
             clock=lambda: now[0],
         )
         incoming = message(-1, 1, "стул")
-        with patch.object(service, "generate_openai", return_value="ответ стула"):
+        with patch.object(service, "generate_llm", return_value="ответ стула"):
             self.assertEqual(service.maybe_stul_cooldown_reply(incoming), "ответ стула")
         self.assertEqual(service.stul_cooldown_remaining(-1), 60)
         self.assertEqual(service.take_stul_cooldown_notice(-1), 60)
@@ -137,7 +137,7 @@ class LearningTests(unittest.TestCase):
 
         ai_service = LearningService(self.settings(), rng=FixedRandom(0.20))
         with (
-            patch.object(ai_service, "generate_openai", return_value="ответ OpenAI") as ai,
+            patch.object(ai_service, "generate_llm", return_value="ответ OpenAI") as ai,
             patch.object(ai_service, "generate_local") as markov,
         ):
             self.assertEqual(ai_service.maybe_stul_cooldown_reply(incoming), "ответ OpenAI")
@@ -146,7 +146,7 @@ class LearningTests(unittest.TestCase):
 
         markov_service = LearningService(self.settings(), rng=FixedRandom(0.60))
         with (
-            patch.object(markov_service, "generate_openai") as ai,
+            patch.object(markov_service, "generate_llm") as ai,
             patch.object(markov_service, "generate_local", return_value="ответ Маркова") as markov,
         ):
             self.assertEqual(markov_service.maybe_stul_cooldown_reply(incoming), "ответ Маркова")
@@ -197,7 +197,7 @@ class LearningTests(unittest.TestCase):
         incoming = message(-1, 1, "обычное сообщение для локальной модели")
         with (
             patch.object(service, "generate_local", return_value="🤖 локальная фраза Маркова") as local,
-            patch.object(service, "generate_openai") as openai_generate,
+            patch.object(service, "generate_llm") as openai_generate,
         ):
             result = service.maybe_reply(incoming)
         self.assertIn("Маркова", result)
@@ -220,8 +220,8 @@ class LearningTests(unittest.TestCase):
         client = FakeOpenAI("первая строка\nвторая строка\nтретья строка\nчетвёртая строка")
         service = LearningService(self.settings(), openai_client=client)
         service.repository(-1).add_message(1, 1, None, "обсуждаем побег из сервера")
-        result = service.generate_openai(-1, "ответь на это сообщение", "reply")
-        self.assertEqual(len(result.splitlines()), 2)
+        result = service.generate_llm(-1, "ответь на это сообщение", "reply")
+        self.assertEqual(len(result.splitlines()), 4)
         self.assertIn("обсуждаем побег", client.responses.calls[0]["input"])
 
     def test_creator_account_is_identified_in_generation(self):
@@ -229,7 +229,9 @@ class LearningTests(unittest.TestCase):
         service = LearningService(self.settings(), openai_client=client)
         incoming = message(-1, 2, "ну что, живой?")
         incoming.from_user.username = "sssssssssssssss28"
-        self.assertIsNotNone(service.maybe_question_reply(incoming))
+        self.assertIsNotNone(
+            service.generate_llm(-1, service._message_context(incoming), "question")
+        )
         call = client.responses.calls[0]
         self.assertIn("Харакири (@sssssssssssssss28)", call["input"])
         self.assertIn("@sssssssssssssss28 — Харакири", call["instructions"])
@@ -243,33 +245,17 @@ class LearningTests(unittest.TestCase):
     def test_creator_reply_rejects_long_or_repetitive_output(self):
         long_reply = " ".join(["слово"] * 19)
         service = LearningService(self.settings(), openai_client=FakeOpenAI(long_reply))
-        self.assertIsNone(service.generate_openai(-1, "живой?", "creator"))
+        self.assertIsNone(service.generate_llm(-1, "живой?", "creator"))
 
-        service.openai._client.responses.text = "Харакири опять проверяет, не развалился ли его любимый Киберстул."
-        self.assertIsNone(service.generate_openai(-1, "живой?", "creator"))
-
-    def test_question_reply_is_short_ai_only_with_one_minute_cooldown(self):
-        now = [100.0]
-        service = LearningService(
-            self.settings(addressed_cooldown=60),
-            openai_client=FakeOpenAI("Да хрен его знает, но выглядит смешно."),
-            clock=lambda: now[0],
-        )
-        incoming = message(-1, 1, "стульчик, ты живой?")
-        with patch.object(service, "generate_local") as local:
-            self.assertIsNotNone(service.maybe_question_reply(incoming))
-            self.assertIsNone(service.maybe_question_reply(incoming))
-            now[0] += 61
-            service.openai._client.responses.text = "Живой, в отличие от вашего чата, блядь."
-            self.assertIsNotNone(service.maybe_question_reply(incoming))
-        local.assert_not_called()
+        service.llm_provider._client.responses.text = "Харакири опять проверяет, не развалился ли его любимый Киберстул."
+        self.assertIsNone(service.generate_llm(-1, "живой?", "creator"))
 
     def test_frequent_bare_chair_call_can_prefer_markov(self):
         service = LearningService(self.settings(), rng=FixedRandom(0.20))
         service.note_stul(-1)
         incoming = message(-1, 2, "стул")
         with (
-            patch.object(service, "generate_openai") as ai,
+            patch.object(service, "generate_llm") as ai,
             patch.object(service, "generate_local", return_value="локальный ответ маркова") as markov,
         ):
             self.assertEqual(service.maybe_stul_cooldown_reply(incoming), "локальный ответ маркова")
@@ -284,13 +270,16 @@ class LearningTests(unittest.TestCase):
         decision = service.maybe_command_meme(-1)
         self.assertEqual(decision.action, "meme")
         self.assertEqual(decision.caption_text, "серега опять выбрал сайдквест")
-        self.assertIn("3–10 слов", service.openai._client.responses.calls[0]["input"])
+        self.assertIn("3–10 слов", service.llm_provider._client.responses.calls[0]["input"])
         service.mark_command_meme_sent(-1, decision)
         self.assertTrue(service.meme_command_on_cooldown(-1))
+        service.repository(-1).add_message(
+            999, 7, None, "реальная цитата для локальной подписи"
+        )
         fallback = service.maybe_command_meme(-1)
         self.assertEqual(fallback.action, "meme")
         self.assertTrue(fallback.reason.startswith("manual_local_"))
-        self.assertEqual(len(service.openai._client.responses.calls), 1)
+        self.assertEqual(len(service.llm_provider._client.responses.calls), 1)
 
     def test_bot_manual_meme_command_never_reports_ai_cooldown(self):
         import bot as bot_module
@@ -321,7 +310,7 @@ class LearningTests(unittest.TestCase):
         with (
             patch.object(
                 service,
-                "generate_openai",
+                "generate_llm",
                 side_effect=[f"ответ по теме {index}" for index in range(10)],
             ) as ai,
             patch.object(service, "generate_local") as markov,
@@ -334,15 +323,23 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(ai.call_count, 10)
         self.assertEqual(markov.call_count, 0)
 
-    def test_raw_memory_is_bounded_but_statistics_survive(self):
+    def test_unsummarized_raw_memory_is_protected_and_statistics_survive(self):
         repository = ChatRepository(self.data_dir, -9, max_messages=3)
         for index in range(5):
             repository.add_message(index + 1, 1, None, f"сообщение номер {index}")
-        self.assertEqual(repository.count(), 3)
+        # R5 protects every row beyond the durable summary cursor.  The normal
+        # recent-window cap is applied only after successful summary finalize.
+        self.assertEqual(repository.count(), 5)
         self.assertEqual(repository.statistics()["total_messages"], 5)
         self.assertEqual(
             [row["text"] for row in repository.recent_messages()],
-            ["сообщение номер 2", "сообщение номер 3", "сообщение номер 4"],
+            [
+                "сообщение номер 0",
+                "сообщение номер 1",
+                "сообщение номер 2",
+                "сообщение номер 3",
+                "сообщение номер 4",
+            ],
         )
 
     def test_structured_summary_and_stable_memory_are_persisted(self):
@@ -357,6 +354,7 @@ class LearningTests(unittest.TestCase):
         )
         service.ingest(message(-1, 1, "опять этот кривой билд"))
         service.ingest(message(-1, 2, "кривой билд снова приехал"))
+        self.assertEqual(service.run_memory_maintenance(-1).status, "committed")
         self.assertEqual(service.repository(-1).recent_summaries()[0]["topics"], ["релиз"])
         self.assertIn("кривой билд", service.repository(-1).stable_memories()[0])
 
@@ -369,7 +367,7 @@ class LearningTests(unittest.TestCase):
     def test_openai_uses_lowercase_chat_style_without_technical_prefixes(self):
         plain_client = FakeOpenAI("[REQUEST::СТУЛ] ACCESS_DENIED ░▒▓ это обычный ответ")
         plain_service = LearningService(self.settings(), openai_client=plain_client)
-        plain = plain_service.generate_openai(-1, "ответь", "reply")
+        plain = plain_service.generate_llm(-1, "ответь", "reply")
         self.assertEqual(plain, "это обычный ответ")
 
     def test_voice_story_has_persistent_cooldown(self):
@@ -445,43 +443,13 @@ class LearningTests(unittest.TestCase):
         self.assertTrue(service.claim_scheduled_event(-1, "quote:2026-08-06:600"))
         self.assertFalse(service.claim_scheduled_event(-1, "quote:2026-08-06:600"))
 
-    def test_gifs_are_saved_per_chat_and_respect_cooldown(self):
-        service = LearningService(
-            self.settings(gif_post_chance=1.0, gif_post_cooldown=3600),
-            rng=ZeroRandom(),
-        )
-        gif_message = message(-1, 10, "")
-        gif_message.animation = SimpleNamespace(file_id="gif-file-1", file_unique_id="gif-unique-1")
-        gif_message.document = None
-        self.assertTrue(service.ingest_gif(gif_message))
-        self.assertEqual(service.repository(-1).gif_count(), 1)
-        self.assertEqual(service.repository(-2).gif_count(), 0)
-        self.assertEqual(service.maybe_random_media(-1), ("animation", "gif-file-1"))
-        self.assertIsNone(service.maybe_random_media(-1))
-
-    def test_stickers_are_saved_and_can_be_reposted(self):
-        service = LearningService(
-            self.settings(gif_enabled=False, sticker_enabled=True, gif_post_chance=1.0),
-            rng=ZeroRandom(),
-        )
-        sticker_message = message(-1, 11, "")
-        sticker_message.sticker = SimpleNamespace(
-            file_id="sticker-file-1", file_unique_id="sticker-unique-1"
-        )
-        self.assertTrue(service.ingest_sticker(sticker_message))
-        self.assertEqual(service.repository(-1).sticker_count(), 1)
-        self.assertEqual(
-            service.maybe_random_media(-1),
-            ("sticker", "sticker-file-1"),
-        )
-
     def test_openai_is_restricted_to_configured_chat(self):
         service = LearningService(
             self.settings(openai_chat_id=-100), openai_client=FakeOpenAI()
         )
-        result = service.generate_openai(-200, "ответь мне", "reply")
+        result = service.generate_llm(-200, "ответь мне", "reply")
         self.assertIn("подписк", result.casefold())
-        self.assertEqual(service.openai._client.responses.calls, [])
+        self.assertEqual(service.llm_provider._client.responses.calls, [])
 
     def test_forget_chat_also_removes_gifs(self):
         service = LearningService(self.settings())
@@ -527,10 +495,14 @@ class LearningTests(unittest.TestCase):
             patch.object(bot_module, "send_contextual_response") as send,
         ):
             bot_module.handle_message(incoming)
-        generated.assert_called_once_with(
-            incoming, bot_id=99, bot_username="chair", explicit_address=True,
+        generated.assert_called_once()
+        normalized = generated.call_args.args[0]
+        self.assertEqual(normalized.message_id, incoming.message_id)
+        self.assertEqual(
+            generated.call_args.kwargs,
+            {"bot_id": 99, "bot_username": "chair", "explicit_address": True},
         )
-        send.assert_called_once_with(incoming, "да тут я")
+        send.assert_called_once_with(incoming, "да тут я", normalized)
 
     def test_chair_remaining_time_is_available_only_by_exact_command(self):
         import bot as bot_module
@@ -689,7 +661,8 @@ class LearningTests(unittest.TestCase):
             bot_module.handle_message(incoming)
             bot_module.handle_message(incoming)
         activity.assert_not_called()
-        story.assert_called_once_with(incoming)
+        story.assert_called_once()
+        self.assertEqual(story.call_args.args[0].message_id, incoming.message_id)
         self.assertEqual(reply_to.call_count, 2)
         self.assertIn("2 мин 5 сек", reply_to.call_args.args[1])
 

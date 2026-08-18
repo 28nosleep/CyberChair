@@ -14,9 +14,9 @@ def load_environment(base_dir=None):
     base_dir = Path(base_dir or Path(__file__).resolve().parent)
     loaded = []
 
-    # A private .env has priority. .env.example remains supported as a fallback
-    # so an uploaded project works with the user's current configuration layout.
-    for path in (base_dir / ".env", base_dir / ".env.example"):
+    # Tracked examples are documentation only. Runtime secrets come from the
+    # process environment or the private, gitignored .env file.
+    for path in (base_dir / ".env",):
         if not path.is_file():
             continue
         for raw_line in path.read_text(encoding="utf-8-sig").splitlines():

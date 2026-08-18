@@ -70,10 +70,12 @@ class LocalMemeFallbackTests(unittest.TestCase):
         self.assertIn("manual_local_old", decision.reason)
         markov.assert_not_called()
 
-    def test_ready_phrase_is_last_fallback_after_markov(self):
-        with patch.object(self.service.meme_sources, "choose", return_value=MemeSource("phrase", "")), patch.object(
+    def test_no_canned_phrase_exists_after_markov(self):
+        with patch.object(self.service.meme_sources, "choose", return_value=MemeSource("none", "")), patch.object(
             self.service, "generate_local", return_value=None
         ):
-            source, caption = self.service._local_command_caption(-1, MemeSource("phrase", ""), [], [])
-        self.assertEqual(source.kind, "phrase")
-        self.assertTrue(caption)
+            source, caption = self.service.media_coordinator._local_command_caption(
+                -1, MemeSource("none", ""), [], []
+            )
+        self.assertEqual(source.kind, "none")
+        self.assertIsNone(caption)

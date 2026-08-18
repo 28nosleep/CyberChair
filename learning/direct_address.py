@@ -77,10 +77,10 @@ class DirectAddressRouter:
         if intent == TRIVIAL:
             return ResponseDecision(True, intent, "P1", "local", "trivial_local", direct_reply)
         if intent == SOCIAL:
-            producer = "grok" if social_ai_useful and ai_available and not budget_exceeded else "local"
+            producer = "llm" if social_ai_useful and ai_available and not budget_exceeded else "local"
             return ResponseDecision(True, intent, "P2", producer, "social_contextual", direct_reply)
         # The soft budget protects low-value calls. P3 remains AI-preferred so a
         # useful question is never silently dropped merely because spend is high.
-        producer = "grok" if ai_available else "local"
+        producer = "llm" if ai_available else "local"
         reason = "substantive_direct" if ai_available else "substantive_local_fallback"
         return ResponseDecision(True, intent, "P3", producer, reason, direct_reply)

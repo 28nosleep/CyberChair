@@ -121,9 +121,15 @@ class CharacterizationTests(unittest.TestCase):
             patch.object(bot_module.bot, "reply_to") as reply_to,
         ):
             bot_module.handle_message(incoming)
-        remember.assert_called_once_with(incoming)
-        ingest.assert_called_once_with(incoming)
-        maybe_reply.assert_called_once_with(incoming, bot_id=7, bot_username="chair")
+        remember.assert_called_once()
+        ingest.assert_called_once()
+        normalized = ingest.call_args.args[0]
+        self.assertIs(remember.call_args.args[0], normalized)
+        self.assertEqual(normalized.message_id, incoming.message_id)
+        self.assertEqual(ingest.call_args.kwargs, {"refresh_memory": True})
+        maybe_reply.assert_called_once_with(
+            normalized, bot_id=7, bot_username="chair"
+        )
         reply_to.assert_called_once_with(incoming, "обычный ответ")
 
     def test_creator_messages_use_the_normal_random_reply_limit(self):
@@ -141,12 +147,13 @@ class CharacterizationTests(unittest.TestCase):
         ):
             bot_module.handle_message(incoming)
         special.assert_called_once_with(
-            incoming,
+            special.call_args.args[0],
             "random",
             bot_module.learning_settings.random_reply_chance,
             "creator",
             addressed=False,
         )
+        self.assertEqual(special.call_args.args[0].message_id, incoming.message_id)
         reply_to.assert_called_once_with(incoming, "коротко")
 
     def test_creator_mentions_do_not_trigger_a_privileged_reply(self):
@@ -166,7 +173,9 @@ class CharacterizationTests(unittest.TestCase):
             patch.object(bot_module.learning_service, "ingest") as ingest,
         ):
             bot_module.handle_message(incoming)
-        reaction.assert_called_once_with(incoming)
+        reaction.assert_called_once()
+        self.assertEqual(reaction.call_args.args[0], incoming)
+        self.assertEqual(reaction.call_args.args[1].message_id, incoming.message_id)
         remember.assert_not_called()
         ingest.assert_not_called()
 
@@ -174,12 +183,16 @@ class CharacterizationTests(unittest.TestCase):
         import bot as bot_module
 
         fake_thread = Mock()
+        fake_thread.is_alive.return_value = False
         with (
             patch.object(bot_module, "TOKEN", "123:configured"),
             patch.dict(bot_module.os.environ, {"XAI_API_KEY": "configured"}),
             patch.object(bot_module, "send_startup_quote") as quote,
             patch.object(bot_module, "send_restart_gif") as gif,
             patch.object(bot_module, "send_startup_meme") as meme,
+            patch.object(bot_module.bot, "stop_polling"),
+            patch.object(bot_module.learning_service.concurrency, "shutdown"),
+            patch.object(bot_module.chat_action_manager, "shutdown"),
             patch.object(bot_module.threading, "Thread", return_value=fake_thread) as thread,
             patch.object(bot_module.bot, "infinity_polling", side_effect=KeyboardInterrupt) as polling,
         ):
@@ -259,7 +272,7 @@ class CharacterizationTests(unittest.TestCase):
         client = SimpleNamespace(responses=FailingResponses())
         service = LearningService(self.settings(), openai_client=client)
         with patch.object(service, "generate_local") as local:
-            self.assertIsNone(service.generate_openai(-1, "ответь на вопрос", "reply"))
+            self.assertIsNone(service.generate_llm(-1, "ответь на вопрос", "reply"))
         local.assert_not_called()
 
     def test_local_generation_uses_only_local_generator(self):
@@ -293,6 +306,7 @@ class CharacterizationTests(unittest.TestCase):
         self.assertIsInstance(provider, LLMProvider)
         service = LearningService(self.settings(summary_message_interval=1), llm_provider=provider)
         service.ingest(message(-1, 20, "обсуждаем релиз и локальный контекст"))
+        self.assertEqual(service.run_memory_maintenance(-1).status, "committed")
         result = service.generate_llm(-1, "что с релизом", "reply")
         self.assertEqual(result, "нормальный короткий ответ стула")
         self.assertIsInstance(provider.generate_requests[0], GenerateRequest)

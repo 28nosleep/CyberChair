@@ -42,7 +42,9 @@ class MediaService:
     def none(reason):
         return MediaDecision(reason=reason)
 
-    def _recent(self, repository):
+    def _recent(self, repository, media_context=None):
+        if media_context is not None:
+            return list(media_context.recent_usage[: self.settings.media_recent_limit])
         return repository.recent_media_usage(self.settings.media_recent_limit)
 
     @staticmethod
@@ -133,9 +135,18 @@ class MediaService:
         pool = [row for row in ranked[:5] if row["score"] >= best - 2.5]
         return self.rng.choice(pool)
 
-    def _cooldown_active(self, repository, action=None, asset_key=None, group=None, seconds=None):
+    def _cooldown_active(self, repository, action=None, asset_key=None, group=None,
+                         seconds=None, media_context=None):
         seconds = self.settings.media_cooldown if seconds is None else seconds
         since = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+        if media_context is not None:
+            return any(
+                str(row.get("created_at") or "") >= since
+                and (action is None or row.get("action") == action)
+                and (asset_key is None or row.get("asset_key") == asset_key)
+                and (group is None or row.get("cooldown_group") == group)
+                for row in media_context.recent_usage
+            )
         return repository.has_media_usage_since(
             since, action=action, asset_key=asset_key, cooldown_group=group
         )
@@ -226,7 +237,8 @@ class MediaService:
                 scored.append((score, asset.weight, asset.id, asset))
         return sorted(scored, reverse=True)
 
-    def _tagged_reaction(self, repository, state, decision, text, selected_memes, recent):
+    def _tagged_reaction(self, repository, state, decision, text, selected_memes,
+                         recent, media_context=None):
         signals = set(normalize_memory(text).split())
         signals.update(normalize_memory(state.dominant_topic or "").split())
         signals.update(normalize_memory(getattr(item, "output", item)) for item in selected_memes or ())
@@ -237,7 +249,12 @@ class MediaService:
         for kind, enabled in (("gif", self.settings.gif_enabled), ("sticker", self.settings.sticker_enabled)):
             if not enabled:
                 continue
-            for row in repository.tagged_media(kind):
+            rows = (
+                media_context.tagged_gifs if media_context is not None and kind == "gif"
+                else media_context.tagged_stickers if media_context is not None
+                else repository.tagged_media(kind)
+            )
+            for row in rows:
                 key = f"{kind}:{row['file_unique_id']}"
                 if key in recent_assets:
                     continue
@@ -287,12 +304,12 @@ class MediaService:
     def decide(self, chat_id, repository, conversation_decision, chat_state,
                short_term_rows, target_text=None, selected_memes=(), local_callbacks=(),
                troll_mode=True, probability_roll=None, meme_roll=None,
-               reaction_roll=None):
+               reaction_roll=None, media_context=None):
         if not troll_mode:
             return self.none("troll_mode_off")
         if conversation_decision.action == "none":
             return self.none("conversation_policy_none")
-        if self._cooldown_active(repository):
+        if self._cooldown_active(repository, media_context=media_context):
             return self.none("media_cooldown")
         chance = self._media_probability(chat_state, conversation_decision.troll_intensity)
         roll = self.rng.random() if probability_roll is None else probability_roll
@@ -302,7 +319,7 @@ class MediaService:
             short_term_rows, conversation_decision.target_message_id
         )
         text = quote or target_text or ""
-        recent = self._recent(repository)
+        recent = self._recent(repository, media_context)
         templates = self._score_templates(
             chat_state, conversation_decision, text, selected_memes,
             local_callbacks, recent,
@@ -311,12 +328,14 @@ class MediaService:
         if quote and templates and meme_probability_roll < self.settings.media_meme_chance:
             asset = templates[0][-1]
             if self._cooldown_active(
-                repository, action="meme", seconds=self.settings.meme_render_cooldown
+                repository, action="meme", seconds=self.settings.meme_render_cooldown,
+                media_context=media_context,
             ):
                 templates = []
             elif self._cooldown_active(
                 repository, group=asset.cooldown_group,
                 seconds=self.settings.media_template_cooldown,
+                media_context=media_context,
             ):
                 templates = []
             else:
@@ -328,7 +347,7 @@ class MediaService:
                 )
         reaction = self._tagged_reaction(
             repository, chat_state, conversation_decision, text,
-            selected_memes, recent,
+            selected_memes, recent, media_context,
         )
         if reaction:
             return reaction[0]
@@ -356,22 +375,4 @@ class MediaService:
                 asset.cooldown_group if asset else f"{decision.action}_reaction"
             )),
             archetype=decision.archetype or (asset.archetype if asset else decision.action),
-        )
-
-    def random_fallback(self, repository):
-        candidates = []
-        gif = repository.random_gif() if self.settings.gif_enabled else None
-        sticker = repository.random_sticker() if self.settings.sticker_enabled else None
-        if gif:
-            candidates.append(("gif", gif))
-        if sticker:
-            candidates.append(("sticker", sticker))
-        if not candidates:
-            return self.none("no_random_assets")
-        kind, row = self.rng.choice(candidates)
-        return MediaDecision(
-            action=kind, asset_id=row["file_id"], confidence=.2,
-            reason="legacy_random_fallback",
-            asset_key=f"{kind}:{row['file_unique_id']}",
-            cooldown_group=f"{kind}_random", archetype=kind,
         )

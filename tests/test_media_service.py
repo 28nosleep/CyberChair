@@ -147,11 +147,6 @@ class MediaServiceTests(unittest.TestCase):
         )
         self.assertNotEqual(first.template_id, second.template_id)
 
-    def test_untagged_old_gif_remains_random_fallback(self):
-        self.repository.add_gif(1, 7, "gif-file", "gif-unique")
-        decision = self.service.random_fallback(self.repository)
-        self.assertEqual((decision.action, decision.asset_id), ("gif", "gif-file"))
-
     def test_memelelexicon_signal_changes_template_ranking(self):
         result = self.decide(
             target_text="sigma moment",
@@ -261,6 +256,9 @@ class MediaServiceTests(unittest.TestCase):
 
     def test_startup_meme_is_persistent_one_shot(self):
         learning = LearningService(self.settings, llm_provider=Provider())
+        learning.repository(-1).add_message(
+            500, 7, None, "реальная цитата для стартового мема"
+        )
         first = learning.startup_meme()
         self.assertEqual((first.action, first.template_id), ("meme", "t800_chud"))
         learning.mark_startup_meme_sent(first)

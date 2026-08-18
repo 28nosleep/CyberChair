@@ -183,7 +183,7 @@ class BehaviorCalibrationTests(unittest.TestCase):
     def test_bare_chair_has_separate_lower_probability(self):
         service = LearningService(self.settings(), rng=FixedRandom(.32))
         with (
-            patch.object(service, "generate_openai") as ai,
+            patch.object(service, "generate_llm") as ai,
             patch.object(service, "generate_local") as markov,
         ):
             self.assertIsNone(service.maybe_stul_cooldown_reply(message("стул")))
@@ -199,7 +199,7 @@ class BehaviorCalibrationTests(unittest.TestCase):
         service = LearningService(self.settings(), rng=FixedRandom(.99))
         incoming = message("стул как приготовить курицу сувид")
         with (
-            patch.object(service, "generate_openai", return_value="63–65 градусов, потом быстро обжарь") as ai,
+            patch.object(service, "generate_llm", return_value="63–65 градусов, потом быстро обжарь") as ai,
             patch.object(service, "generate_local") as markov,
         ):
             result = service.maybe_stul_cooldown_reply(incoming)
@@ -226,7 +226,7 @@ class BehaviorCalibrationTests(unittest.TestCase):
                 index, 7, None, f"последнее сообщение live edge {index}",
                 now - timedelta(days=2),
             )
-        corpus = service._markov_corpus(repository, current=now)
+        corpus = service.generation._markov_corpus(repository, current=now)
         texts = [row["text"] for row in corpus]
         self.assertEqual(len(texts), 5)
         self.assertNotIn("слишком свежая фраза не для маркова", texts)
@@ -246,7 +246,7 @@ class BehaviorCalibrationTests(unittest.TestCase):
             "уникальная свежая последовательность семь восемь девять",
         ), 1):
             repository.add_message(index, 7, None, text, old)
-        model, _ = service._model_and_messages(-1)
+        model, _ = service.generation._model_and_messages(-1)
         learned = " ".join(
             word for options in model.transitions.values() for word in options
         ).casefold()
@@ -261,10 +261,10 @@ class BehaviorCalibrationTests(unittest.TestCase):
             "bot_copy",
         )
 
-    def test_ai_event_never_calls_markov_and_failed_ai_does_not_fallback(self):
+    def test_ai_event_never_calls_markov_and_failed_meme_ai_uses_local_without_second_llm(self):
         service = LearningService(self.settings(), rng=FixedRandom(.05))
         with (
-            patch.object(service, "generate_openai", return_value="один ответ") as ai,
+            patch.object(service, "generate_llm", return_value="один ответ") as ai,
             patch.object(service, "generate_local") as markov,
         ):
             self.assertEqual(service.maybe_stul_cooldown_reply(message("стул")), "один ответ")
@@ -275,12 +275,14 @@ class BehaviorCalibrationTests(unittest.TestCase):
             patch.object(service, "provider_available", return_value=True),
             patch.object(service, "meme_command_on_cooldown", return_value=False),
             patch.object(service.meme_sources, "choose", return_value=MemeSource("old", "старая цитата")),
-            patch.object(service, "generate_openai", return_value=None) as ai,
-            patch.object(service, "_local_command_caption") as local,
+            patch.object(service, "generate_llm", return_value=None) as ai,
+            patch.object(service.media_coordinator, "_local_command_caption", return_value=(
+                MemeSource("old", "старая цитата"), "старая цитата"
+            )) as local,
         ):
-            self.assertIsNone(service.maybe_command_meme(-1))
+            self.assertIsNotNone(service.maybe_command_meme(-1))
         ai.assert_called_once()
-        local.assert_not_called()
+        local.assert_called_once()
 
     def test_untagged_gif_reaches_contextual_telegram_sender(self):
         repository = ChatRepository(self.root, -1, 50)

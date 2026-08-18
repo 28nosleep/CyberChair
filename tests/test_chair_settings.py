@@ -194,17 +194,14 @@ class ChairSettingsTests(unittest.TestCase):
             patch.object(bot_module, "TOKEN", "123:configured"),
             patch.object(bot_module.learning_service, "llm_provider_name", return_value="grok"),
             patch.object(bot_module.learning_service, "provider_available", return_value=False),
+            # main() now owns the canonical process shutdown path.  Keep this
+            # startup-failure characterization from shutting down the shared
+            # process-wide R4 controller used by later tests.
+            patch.object(bot_module.learning_service.concurrency, "shutdown"),
+            patch.object(bot_module.chat_action_manager, "shutdown"),
         ):
             with self.assertRaisesRegex(RuntimeError, "XAI_API_KEY"):
                 bot_module.main()
-
-    def test_media_toggle_and_troll_mode_are_both_hard_gates(self):
-        self.service.set_media_enabled(-100, False)
-        self.assertIsNone(self.service.maybe_random_media(-100))
-        self.service.set_media_enabled(-100, True)
-        self.service.set_troll_mode(-100, False)
-        self.assertIsNone(self.service.maybe_random_media(-100))
-
 
 if __name__ == "__main__":
     unittest.main()

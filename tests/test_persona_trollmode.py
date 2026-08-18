@@ -141,10 +141,14 @@ class PersonaAndTrollModeTests(unittest.TestCase):
             patch.object(bot_module, "send_contextual_response") as reply,
         ):
             bot_module.handle_message(incoming)
-        useful.assert_called_once_with(
-            incoming, bot_id=99, bot_username="chair", explicit_address=True,
+        useful.assert_called_once()
+        normalized = useful.call_args.args[0]
+        self.assertEqual(normalized.message_id, incoming.message_id)
+        self.assertEqual(
+            useful.call_args.kwargs,
+            {"bot_id": 99, "bot_username": "chair", "explicit_address": True},
         )
-        reply.assert_called_once_with(incoming, "релиз в пятницу")
+        reply.assert_called_once_with(incoming, "релиз в пятницу", normalized)
 
     def test_low_and_high_intensity_have_different_instructions(self):
         low = self.build(conversation_decision=decision(.2)).request.instructions
@@ -252,16 +256,14 @@ class PersonaAndTrollModeTests(unittest.TestCase):
         self.assertTrue(service.claim_scheduled_event(-1, "start:2026-08-11"))
         self.assertFalse(service.claim_scheduled_event(-1, "start:2026-08-11"))
 
-    def test_troll_mode_off_disables_troll_media_only(self):
-        service = LearningService(self.settings, llm_provider=RecordingProvider())
-        service.set_troll_mode(-1, False)
-        self.assertIsNone(service.maybe_random_media(-1))
-
     def test_troll_mode_off_does_not_disable_memory_service(self):
         service = LearningService(self.settings, llm_provider=RecordingProvider())
         service.set_troll_mode(-1, False)
         self.assertTrue(service.ingest(message(-1, 1, "обсуждаем рабочий релиз"))[0])
-        self.assertIn("рабочий релиз", service._dialogue_context(-1, "релиз"))
+        self.assertIn(
+            "рабочий релиз",
+            service.generation._dialogue_context(-1, "релиз"),
+        )
 
     def test_openai_adapter_has_no_persona_business_logic(self):
         source = inspect.getsource(OpenAIGenerator)

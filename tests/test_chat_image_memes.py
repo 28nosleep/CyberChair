@@ -56,6 +56,9 @@ class ChatImageMemeSelectionTests(unittest.TestCase):
             chat_image_background_chance=.35,
         )
         self.service = LearningService(self.settings, rng=ZeroRandom())
+        self.service.repository(-1).add_message(
+            1, 7, None, "реальная реплика из чата для подписи"
+        )
         self.cooldown = patch.object(
             self.service, "meme_command_on_cooldown", return_value=True
         )
@@ -113,7 +116,9 @@ class ChatImageMemeSelectionTests(unittest.TestCase):
         repository = self.service.repository(-1)
         repository.add_chat_image(**self.service.telegram_image_metadata(reply))
         repository.mark_chat_image_used("chosen-u", "old-caption", 7)
-        with patch.object(self.service, "_curated_command_background") as curated:
+        with patch.object(
+            self.service.media_coordinator, "_curated_command_background"
+        ) as curated:
             decision = self.service.maybe_command_meme(command(reply))
         curated.assert_not_called()
         self.assertEqual(decision.background_file_id, "chosen")
@@ -164,6 +169,9 @@ class ChatImageMemeSelectionTests(unittest.TestCase):
         self.assertEqual(history.background_file_id, "history")
 
         empty_service = LearningService(self.settings, rng=ZeroRandom())
+        empty_service.repository(-2).add_message(
+            1, 7, None, "другая реальная реплика из истории"
+        )
         with patch.object(empty_service, "meme_command_on_cooldown", return_value=True):
             curated = empty_service.maybe_command_meme(-2)
         self.assertIsNone(curated.background_file_id)
@@ -172,7 +180,7 @@ class ChatImageMemeSelectionTests(unittest.TestCase):
     def test_cooldown_keeps_explicit_image_and_uses_no_ai_or_markov(self):
         reply = image_message(10, [photo("chosen", "chosen-u", 800, 600)])
         with (
-            patch.object(self.service, "generate_openai") as ai,
+            patch.object(self.service, "generate_llm") as ai,
             patch.object(self.service, "generate_local") as markov,
         ):
             decision = self.service.maybe_command_meme(command(reply))
@@ -188,7 +196,7 @@ class ChatImageMemeSelectionTests(unittest.TestCase):
         with (
             patch.object(self.service, "meme_command_on_cooldown", return_value=False),
             patch.object(self.service, "provider_available", return_value=True),
-            patch.object(self.service, "generate_openai", return_value="короткая подпись") as ai,
+            patch.object(self.service, "generate_llm", return_value="короткая подпись") as ai,
         ):
             decision = self.service.maybe_command_meme(command(reply), "про серёгу")
         self.assertEqual(ai.call_count, 1)
@@ -279,7 +287,10 @@ class ChatImageRoutingAndCleanupTests(unittest.TestCase):
             patch.object(bot_module.bot, "reply_to") as reply,
         ):
             bot_module.handle_message(incoming)
-        send.assert_called_once_with(incoming, hint="про серёгу")
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args, (incoming,))
+        self.assertEqual(send.call_args.kwargs["hint"], "про серёгу")
+        self.assertEqual(send.call_args.kwargs["event"].message_id, incoming.message_id)
         direct.assert_not_called()
         reply.assert_not_called()
 

@@ -55,11 +55,111 @@ def _timezone_name():
 @dataclass(frozen=True)
 class LearningSettings:
     enabled: bool = field(default_factory=lambda: _bool("LEARNING_ENABLED", True))
+    shutdown_grace_seconds: float = field(
+        default_factory=lambda: max(
+            1.0, _float("SHUTDOWN_GRACE_SECONDS", 30.0)
+        )
+    )
+    # R4 operational admission limits. These cap process resources without
+    # changing the per-event LLM budget or any routing probability.
+    llm_max_concurrency: int = field(
+        default_factory=lambda: max(1, _int("LLM_MAX_CONCURRENCY", 2))
+    )
+    media_max_concurrency: int = field(
+        default_factory=lambda: max(1, _int("MEDIA_MAX_CONCURRENCY", 1))
+    )
+    llm_admission_timeout_seconds: float = field(
+        default_factory=lambda: max(
+            0.0, _float("LLM_ADMISSION_TIMEOUT_SECONDS", 5.0)
+        )
+    )
+    media_admission_timeout_seconds: float = field(
+        default_factory=lambda: max(
+            0.0, _float("MEDIA_ADMISSION_TIMEOUT_SECONDS", 15.0)
+        )
+    )
+    # R5 durable background memory lifecycle. The protected outage envelope is
+    # intentionally much larger than the normal 50-row conversational window:
+    # 500 * the existing 2k text ceiling is roughly 1 MB of text per chat.
+    max_unsummarized_messages: int = field(
+        default_factory=lambda: max(50, _int("MAX_UNSUMMARIZED_MESSAGES", 500))
+    )
+    summary_batch_messages: int = field(
+        default_factory=lambda: max(1, _int("SUMMARY_BATCH_MESSAGES", 50))
+    )
+    summary_batch_chars: int = field(
+        default_factory=lambda: max(1000, _int("SUMMARY_BATCH_CHARS", 20000))
+    )
+    summary_claim_lease_seconds: int = field(
+        default_factory=lambda: max(30, _int("SUMMARY_CLAIM_LEASE_SECONDS", 300))
+    )
+    summary_failure_backoff_base_seconds: int = field(
+        default_factory=lambda: max(
+            30, _int("SUMMARY_FAILURE_BACKOFF_BASE_SECONDS", 300)
+        )
+    )
+    summary_failure_backoff_cap_seconds: int = field(
+        default_factory=lambda: max(
+            300, _int("SUMMARY_FAILURE_BACKOFF_CAP_SECONDS", 21600)
+        )
+    )
+    max_memory_candidates: int = field(
+        default_factory=lambda: max(20, _int("MAX_MEMORY_CANDIDATES", 200))
+    )
+    memory_candidate_stale_days: int = field(
+        default_factory=lambda: max(1, _int("MEMORY_CANDIDATE_STALE_DAYS", 30))
+    )
+    memory_candidate_promoted_retention_days: int = field(
+        default_factory=lambda: max(
+            1, _int("MEMORY_CANDIDATE_PROMOTED_RETENTION_DAYS", 7)
+        )
+    )
+    daily_summary_retention_days: int = field(
+        default_factory=lambda: max(7, _int("DAILY_SUMMARY_RETENTION_DAYS", 90))
+    )
+    # R7 operational persistence retention. Detailed LLM metering is kept for
+    # recent diagnostics and compacted into non-content daily aggregates.
+    llm_call_retention_days: int = field(
+        default_factory=lambda: max(7, _int("LLM_CALL_RETENTION_DAYS", 90))
+    )
+    routing_event_retention_days: int = field(
+        default_factory=lambda: max(7, _int("ROUTING_EVENT_RETENTION_DAYS", 31))
+    )
+    scheduled_event_retention_days: int = field(
+        default_factory=lambda: max(1, _int("SCHEDULED_EVENT_RETENTION_DAYS", 14))
+    )
+    scheduled_claim_lease_seconds: int = field(
+        default_factory=lambda: max(
+            30, _int("SCHEDULED_CLAIM_LEASE_SECONDS", 120)
+        )
+    )
+    scheduled_delivery_max_attempts: int = field(
+        default_factory=lambda: max(
+            1, _int("SCHEDULED_DELIVERY_MAX_ATTEMPTS", 5)
+        )
+    )
+    scheduled_retry_backoff_base_seconds: int = field(
+        default_factory=lambda: max(
+            1, _int("SCHEDULED_RETRY_BACKOFF_BASE_SECONDS", 30)
+        )
+    )
+    scheduled_retry_backoff_cap_seconds: int = field(
+        default_factory=lambda: max(
+            30, _int("SCHEDULED_RETRY_BACKOFF_CAP_SECONDS", 3600)
+        )
+    )
+    persistence_maintenance_interval_seconds: int = field(
+        default_factory=lambda: max(
+            3600, _int("PERSISTENCE_MAINTENANCE_INTERVAL_SECONDS", 86400)
+        )
+    )
     default_activity_percent: int = field(default_factory=lambda: _int("DEFAULT_ACTIVITY_PERCENT", 100))
     min_training_messages: int = field(default_factory=lambda: _int("MIN_TRAINING_MESSAGES", 20))
     random_reply_chance: float = field(default_factory=lambda: _float("RANDOM_REPLY_CHANCE", 0.24))
     active_chat_reply_chance: float = field(default_factory=lambda: _float("ACTIVE_CHAT_REPLY_CHANCE", 0.16))
-    openai_random_reply_chance: float = field(default_factory=lambda: _float("OPENAI_RANDOM_REPLY_CHANCE", 0.12))
+    llm_random_reply_chance: float = field(default_factory=lambda: _float(
+        "LLM_RANDOM_REPLY_CHANCE", _float("OPENAI_RANDOM_REPLY_CHANCE", 0.12)
+    ))
     reply_to_stul_chance: float = field(default_factory=lambda: _float("REPLY_TO_STUL_CHANCE", 0.40))
     # Applied locally only to explicitly addressed substantive turns while
     # TrollMode is enabled. Kept in config so it can later become per-chat UI.
@@ -118,8 +218,6 @@ class LearningSettings:
     openai_enabled: bool = field(default_factory=lambda: _bool("OPENAI_ENABLED", True))
     openai_chat_id: int | None = field(default_factory=lambda: _optional_int("OPENAI_CHAT_ID") or _optional_int("TELEGRAM_CHAT_ID"))
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-5.6-luna"))
-    openai_daily_min: int = field(default_factory=lambda: _int("OPENAI_DAILY_MIN", 5))
-    openai_daily_max: int = field(default_factory=lambda: _int("OPENAI_DAILY_MAX", 7))
     openai_timeout: float = field(default_factory=lambda: _float("OPENAI_TIMEOUT", 20.0))
     # XAI_MODEL remains a backwards-compatible alias for the reply model.
     xai_model: str = field(default_factory=lambda: os.getenv("XAI_MODEL", "grok-4.5"))
@@ -138,7 +236,14 @@ class LearningSettings:
     xai_summary_reasoning_effort: str = field(default_factory=lambda: os.getenv(
         "XAI_SUMMARY_REASONING_EFFORT", "none"
     ).strip().casefold())
-    reply_max_output_tokens: int = field(default_factory=lambda: _int("REPLY_MAX_OUTPUT_TOKENS", 100))
+    # Purpose-specific output ceilings preserve the current routing budgets.
+    short_max_output_tokens: int = field(default_factory=lambda: _int("SHORT_MAX_OUTPUT_TOKENS", 120))
+    troll_user_max_output_tokens: int = field(default_factory=lambda: _int("TROLL_USER_MAX_OUTPUT_TOKENS", 180))
+    opinion_max_output_tokens: int = field(default_factory=lambda: _int("OPINION_MAX_OUTPUT_TOKENS", 240))
+    recommendation_max_output_tokens: int = field(default_factory=lambda: _int("RECOMMENDATION_MAX_OUTPUT_TOKENS", 280))
+    useful_max_output_tokens: int = field(default_factory=lambda: _int("USEFUL_MAX_OUTPUT_TOKENS", 360))
+    recipe_max_output_tokens: int = field(default_factory=lambda: _int("RECIPE_MAX_OUTPUT_TOKENS", 480))
+    complex_max_output_tokens: int = field(default_factory=lambda: _int("COMPLEX_MAX_OUTPUT_TOKENS", 460))
     autonomous_max_output_tokens: int = field(default_factory=lambda: _int("AUTONOMOUS_MAX_OUTPUT_TOKENS", 90))
     meme_max_output_tokens: int = field(default_factory=lambda: _int("MEME_MAX_OUTPUT_TOKENS", 50))
     summary_max_output_tokens: int = field(default_factory=lambda: _int("SUMMARY_MAX_OUTPUT_TOKENS", 240))
@@ -149,8 +254,6 @@ class LearningSettings:
     xai_daily_chat_budget_usd: float = field(default_factory=lambda: _float("XAI_DAILY_CHAT_BUDGET_USD", 0.0))
     direct_social_markov_share: float = field(default_factory=lambda: _float("DIRECT_SOCIAL_MARKOV_SHARE", 0.12))
     gif_enabled: bool = field(default_factory=lambda: _bool("GIF_ENABLED", True))
-    gif_post_chance: float = field(default_factory=lambda: _float("GIF_POST_CHANCE", 0.65))
-    gif_post_cooldown: int = field(default_factory=lambda: _int("GIF_POST_COOLDOWN", 3600))
     max_gifs_per_chat: int = field(default_factory=lambda: _int("MAX_GIFS_PER_CHAT", 1000))
     sticker_enabled: bool = field(default_factory=lambda: _bool("STICKER_ENABLED", True))
     max_stickers_per_chat: int = field(default_factory=lambda: _int("MAX_STICKERS_PER_CHAT", 1000))

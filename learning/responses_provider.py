@@ -3,6 +3,7 @@ import logging
 import re
 
 from .preprocessing import FOREIGN_BOT_COMMAND_RE, normalize_spaces, strip_mentions
+from .llm_provider import GenerateResult
 
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,23 @@ class ResponsesLLMProvider:
             # Metering must never make the live response unavailable.
             log.warning("%s usage accounting failed", self.provider_label)
 
+    def _incomplete_reason(self, response):
+        status = str(getattr(response, "status", "") or "").casefold()
+        details = getattr(response, "incomplete_details", None)
+        reason = self._usage_value(details, "reason")
+        if not reason:
+            reason = getattr(response, "finish_reason", None)
+        if not reason:
+            choices = getattr(response, "choices", None) or ()
+            reason = getattr(choices[0], "finish_reason", None) if choices else None
+        reason = str(reason or "").casefold()
+        if status == "incomplete" and not reason:
+            reason = "incomplete"
+        aliases = {"length": "max_output_tokens", "max_tokens": "max_output_tokens"}
+        return aliases.get(reason, reason) if reason in {
+            "length", "max_tokens", "max_output_tokens", "incomplete"
+        } else None
+
     def generate(self, request):
         if not self.available:
             log.warning("%s unavailable: %s", self.provider_label, self.unavailable_reason)
@@ -64,6 +82,17 @@ class ResponsesLLMProvider:
         try:
             response = self._create(request)
             self._record_usage(request, response)
+            incomplete_reason = self._incomplete_reason(response)
+            usage = getattr(response, "usage", None)
+            output_tokens = self._usage_value(usage, "output_tokens")
+            if incomplete_reason:
+                metadata = request.metadata or {}
+                log.warning(
+                    "LLM_INCOMPLETE chat_id=%s purpose=%s model=%s reason=%s output_tokens=%s limit=%s",
+                    metadata.get("chat_id"), metadata.get("response_purpose", metadata.get("purpose")),
+                    self._model_for_request(request), incomplete_reason, output_tokens,
+                    request.max_output_tokens,
+                )
             cleaned_lines = []
             for raw_line in response.output_text.splitlines():
                 line = re.sub(r"\[[^\]\n]{1,60}\]\s*", "", raw_line)
@@ -78,10 +107,21 @@ class ResponsesLLMProvider:
                 if line:
                     cleaned_lines.append(line.lower().rstrip(".!…"))
             purpose = (request.metadata or {}).get("purpose")
-            lines = cleaned_lines[:5] if purpose == "voice_story" else cleaned_lines[:2]
+            response_purpose = (request.metadata or {}).get("response_purpose")
+            # Long useful answers may legitimately contain multiple lines. No
+            # character/sentence slicing happens here or in the Telegram layer.
+            if purpose == "voice_story":
+                lines = cleaned_lines[:5]
+            elif response_purpose in {"recipe_instruction", "complex_explanation", "useful_answer", "recommendation", "opinion"}:
+                lines = cleaned_lines[:24]
+            else:
+                lines = cleaned_lines[:2]
             if not self.settings.allow_user_mentions:
                 lines = [strip_mentions(line) for line in lines]
-            return "\n".join(lines).strip()
+            return GenerateResult(
+                "\n".join(lines).strip(), incomplete_reason=incomplete_reason,
+                output_tokens=output_tokens, limit=request.max_output_tokens,
+            )
         except Exception as error:
             log.warning("%s generation failed: %s", self.provider_label, type(error).__name__)
             return None

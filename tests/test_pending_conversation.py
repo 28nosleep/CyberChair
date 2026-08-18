@@ -84,7 +84,7 @@ class PendingConversationTests(unittest.TestCase):
         )
         self.assertIn("следил", result)
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(service._last_direct_decision[-1].intent, "substantive")
+        self.assertEqual(service.foreground._last_direct_decision[-1].intent, "substantive")
 
     def test_ambiguous_choice_creates_pending(self):
         service, provider = self.service(["между чем выбираешь, лил бро?"])
@@ -103,7 +103,7 @@ class PendingConversationTests(unittest.TestCase):
         )
         self.assertIn("между чем", result)
         self.assertEqual(question_intent("так и как по итогу прославиться в рэпе"), "how_to")
-        self.assertEqual(service._last_direct_decision[-1].intent, "substantive")
+        self.assertEqual(service.foreground._last_direct_decision[-1].intent, "substantive")
         self.assertIsNone(service.pending_conversation(-1, 7))
         self.assertEqual(len(provider.calls), 1)
 
@@ -161,7 +161,10 @@ class PendingConversationTests(unittest.TestCase):
         self.assertIsNone(pending)
         from learning.pending_conversation import PendingConversation
         fake = PendingConversation(-1, 7, None, 1, "что выбрать", "между чем?", "substantive", "", "choices", "hard", datetime.now(timezone.utc))
-        self.assertNotIn("из этих вариантов", service._local_continuation_fallback(fake, "первый"))
+        self.assertNotIn(
+            "из этих вариантов",
+            service.foreground._local_continuation_fallback(fake, "первый"),
+        )
 
     def test_thirty_direct_question_intent_matrix(self):
         cases = (

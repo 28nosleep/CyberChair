@@ -65,5 +65,13 @@ def significant_words(text):
     ]
 
 
+def lexical_stem(word):
+    """Conservative prefix hint for common Russian inflection."""
+    value = str(word or "").casefold().replace("ё", "е")
+    if len(value) < 3:
+        return value
+    return value[:3] if len(value) <= 4 else value[:5]
+
+
 def strip_mentions(text):
     return normalize_spaces(MENTION_RE.sub("кто-то", text))

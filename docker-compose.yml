@@ -3,7 +3,8 @@ services:
     build: .
     container_name: cyberchair
     env_file:
-      - .env.example
+      - .env
     restart: unless-stopped
+    stop_grace_period: 35s
     volumes:
       - ./data:/app/data
