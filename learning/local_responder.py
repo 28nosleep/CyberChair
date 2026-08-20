@@ -14,50 +14,31 @@ PROFANITY_RE = re.compile(
 
 RESPONSES = {
     "summon": (
-        "чё", "ну", "🪑", "chairOS на связи", "хули", "цель обнаружена",
-        "да тут я", "говори давай", "стул загружен, вещай",
-    ),
-    "acknowledgement": (
-        "ага", "принято", "ну допустим", "слышу", "зафиксировал эту хуйню",
-        "chairOS кивнул", "ладно, живи",
+        "чё", "🪑", "да тут я", "говори давай",
     ),
     "laugh": (
-        "ахах, блять", "💀", "это уже канон", "ору", "пик диалога",
-        "брейнрот принят", "смешно вышло, не спорю",
+        "ахах, блять", "💀", "ору", "смешно вышло, не спорю",
     ),
     "insult_to_chair": (
         "сам такой, биологический объект", "сильный аргумент, лил бро",
-        "ругайся точнее, я записываю", "chairOS пережил и не такое",
-        "цель обнаружена. интеллект пока нет", "ну поплачь об обивку",
-        "ебать, chairOS уничтожен словом из трёх букв", "иди нахуй точнее, я протоколирую",
+        "ругайся точнее, я записываю", "ну поплачь об обивку",
     ),
     "confusion": (
         "в смысле", "раскрой эту шизотеорию", "чё конкретно", "говори словами",
-        "контекст потерян где-то между соей и крашаутом",
     ),
-    "argument": (
-        "звучит как коуп", "сильный ларп, фактов пока ноль",
-        "ну и кто тут сейчас нпс", "аргумент мид, подача гигачад",
-        "chairOS фиксирует крашаут", "бро живёт у тебя рент фри",
-        "нихуя себе уверенность при нулевой доказательной базе",
+}
+
+# Small semantic pieces, not a bank of complete interchangeable replies.
+FRAGMENTS = {
+    "reaction": ("ну да", "сильный заход", "вижу картину", "прекрасно"),
+    "judgement": (
+        "а последствия опять назначишь виноватыми",
+        "уверенность есть, доказательная база вышла покурить",
+        "план звучит ровно до встречи с реальностью",
+        "это уже не случайность, а выбранный стиль жизни",
     ),
-    "dismissal": (
-        "иди сам, у меня колёсики", "неубедительно", "отклонено по причине skill issue",
-        "ну давай, выдохни", "протокол обиды не найден",
-    ),
-    "fallback": (
-        "говори давай", "я слушаю", "ну и", "продолжай эту хуйню",
-        "chairOS ждёт конкретики", "принял, что дальше",
-    ),
-    "substantive_fallback": (
-        "chairOS сейчас без внешнего мозга, но вопрос понял; повтори через минуту",
-        "внешний мозг отвалился, не буду выдумывать ответ из обивки; попробуй ещё раз через минуту",
-        "вопрос принят, но сейчас лучше повторить его через минуту, чем получить фанфик от колёсиков",
-    ),
-    "how_to_unavailable": (
-        "chairOS сейчас без больших мозгов, но вопрос понял; повтори через минуту",
-        "вопрос понятен, просто внешний мозг отвалился; попробуй ещё раз через минуту",
-    ),
+    "closer": ("живём", "продолжай наблюдение", "записал в лор", "не останавливайся"),
+    "machine": ("chairOS сверил протокол", "цель обнаружена", "система это запомнила"),
 }
 
 NEUTRAL_RESPONSES = {
@@ -94,6 +75,106 @@ class LocalResponder:
         index = min(len(fresh) - 1, int(self.rng.random() * len(fresh)))
         return fresh[index]
 
+    @staticmethod
+    def _terms(text):
+        return [
+            word for word in re.findall(r"[а-яёa-z0-9-]+", (text or "").casefold())
+            if len(word) >= 4 and word not in {
+                "какой", "какая", "какие", "почему", "зачем", "когда", "который",
+                "сегодня", "сейчас", "можно", "нужно", "просто", "опять", "через",
+                "стул", "стульчик", "киберстул", "тебя", "меня", "этого", "будет",
+            }
+        ]
+
+    @staticmethod
+    def _focus(text):
+        clean = normalize_spaces(text or "").strip(" .,!?:;—-")
+        clean = re.sub(r"^(?:стул|стульчик|киберстул)[, ]+", "", clean, flags=re.I)
+        quoted = re.search(r"[«\"]([^»\"]{3,80})[»\"]", clean)
+        if quoted:
+            return quoted.group(1)
+        time_action = re.search(
+            r"((?:до|в)\s+\d{1,2}(?::\d{2})?\s*(?:утра|ночи|вечера)?[^,.!?]{0,55})",
+            clean, re.I,
+        )
+        if time_action:
+            return time_action.group(1).strip()
+        words = cls_words = re.findall(r"[а-яёa-z0-9-]+", clean, re.I)
+        del cls_words
+        return " ".join(words[-8:])[:100]
+
+    def _contextual_callback(self, text, stable_memories, recent_dialogue, user_id):
+        terms = set(self._terms(text))
+        candidates = []
+        for value in stable_memories or ():
+            clean = normalize_spaces(str(value))
+            overlap = terms & set(self._terms(clean))
+            if overlap:
+                candidates.append((len(overlap) + 2, clean))
+        for age, row in enumerate(reversed(tuple(recent_dialogue or ())[:-1])):
+            if row.get("speaker") == "cyberchair":
+                continue
+            clean = normalize_spaces(row.get("text", ""))
+            overlap = terms & set(self._terms(clean))
+            same_user = user_id is not None and row.get("user_id") == user_id
+            if overlap and (same_user or len(overlap) >= 2):
+                candidates.append((len(overlap) * 2 + same_user - age * .05, clean))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1][:110]
+
+    def _composed_candidates(self, text, intent, callback, troll_mode, username):
+        focus = self._focus(text)
+        terms = self._terms(text)
+        topic = " ".join(terms[:3]) or focus
+        name = f"@{username}" if username else "бро"
+        if intent == SUBSTANTIVE:
+            return [
+                f"про «{topic}» вопрос понял, но без внешнего мозга содержательный ответ выдумывать не буду",
+                f"вижу вопрос про «{topic}»; local path тут только соврёт, повтори, когда внешний мозг отпустит cooldown",
+                f"{name}, контекст про «{topic}» пойман, но внешний мозг недоступен — фактический фанфик не подсовываю",
+            ]
+        candidates = []
+        if callback:
+            return [
+                f"раньше было «{callback}», а теперь «{focus}» — лор сам себя уже опровергает",
+                f"сверил с прошлым: «{callback}». нынешнее «{focus}» выглядит как новый сезон того же сериала",
+            ]
+        if focus:
+            candidates.extend((
+                f"{focus}, а последствия опять будут изображать внезапность",
+                f"в формулировке «{focus}» уже слышно, как план встречается с реальностью",
+                f"{name} принёс «{focus}» с уверенностью финального решения",
+                f"если кратко: {focus}. если честно: это ещё только начало арки",
+                f"по факту: {focus}, а оправдания уже разминаются у входа",
+                f"итог наблюдения: {focus} уверенно превращается в постоянную рубрику",
+                f"вот и приехали: {focus}, сюрприз назначен задним числом",
+                f"сюжет дня — {focus}; сценаристы опять отказались от реализма",
+                f"сначала было решение, потом появилось «{focus}» и всё встало на место",
+                f"{name}, «{focus}» звучит как начало отчёта, который никто не хотел писать",
+            ))
+        reaction = FRAGMENTS["reaction"]
+        judgement = FRAGMENTS["judgement"]
+        for left, right in zip(reaction, judgement):
+            candidates.append(f"{left}: {focus or topic}, {right}")
+        if troll_mode and focus and self.rng.random() < .04:
+            candidates.append(f"{FRAGMENTS['machine'][0]}: {focus}; {FRAGMENTS['closer'][2]}")
+        return candidates
+
+    def _history_pattern_candidates(self, text, recent_generated):
+        """Reuse only a short construction/opening, never another reply's premise."""
+        focus = self._focus(text)
+        for previous in reversed(tuple(recent_generated or ())[-30:]):
+            clean = normalize_spaces(str(previous))
+            opening = clean.partition(":")[0].strip(" .,!?:;—-")
+            words = opening.split()
+            if (
+                ":" in clean and 1 <= len(words) <= 3 and len(opening) <= 28
+                and not re.search(r"(?:chairos|классик|цель обнаружена)", opening, re.I)
+            ):
+                return [f"{opening}: {focus}, а дальше реальность сама допишет протокол"]
+        return []
+
     def _troll_user(self, text, repository, excluded_meme_ids, excluded_meme_groups,
                     recent_generated=None, stable_memories=None):
         """A real roast fallback: never turn provider failure into advice."""
@@ -110,6 +191,7 @@ class LocalResponder:
             (r"девушк|расстав", "романтический сериал"),
             (r"кот|дом|переезд", "бытовой survival"),
         ) if re.search(pattern, normalized)), "этот план")
+        detail = self._focus(text)
         callbacks = []
         terms = set(re.findall(r"[а-яёa-z0-9]{4,}", normalized))
         for item in (
@@ -121,17 +203,17 @@ class LocalResponder:
                 callbacks.append(value[:100])
         if callbacks:
             variants = [
-                f"вчерашний лор про «{callbacks[0]}» уже был намёком, а ты всё равно пришёл прокачивать {topic} как побочный квест",
-                f"chairOS сверил память: «{callbacks[0]}». похоже, {topic} у тебя не вопрос, а сезонная арка без финала",
+                f"раньше было «{callbacks[0]}», теперь «{detail}» — лор сам себя уже опровергает",
+                f"память говорит «{callbacks[0]}», текущая серия — «{detail}» и финала опять нет",
             ]
         else:
             variants = [
-                f"бро смотрит на {topic} так, будто финальный босс сам выдаст ему гайд после этой формулировки",
-                f"достижение разблокировано: спросить про {topic} с уверенностью человека, который уже проиграл туториал",
-                f"chairOS фиксирует: {topic} снова пытаются закрыть одним сообщением, как будто реальность подписана на премиум",
-                f"по постановке видно: {topic} у тебя уже не проблема, а франшиза с нулевым бюджетом",
-                f"это не вопрос про {topic}, это заявка на то, чтобы взрослый интернет сделал за тебя домашку",
-                f"у тебя с {topic} такой контакт, будто ты открыл меню настроек и сразу начал переговоры с богом",
+                f"«{detail}» — бро смотрит на {topic} так, будто финальный босс сам выдаст ему гайд",
+                f"достижение разблокировано: «{detail}» с уверенностью уже проигравшего туториал",
+                f"{detail}: {topic} опять пытаются закрыть одним сообщением, будто реальность подписана на премиум",
+                f"по формулировке «{detail}» видно: {topic} уже франшиза с нулевым бюджетом",
+                f"«{detail}» — заявка на то, чтобы взрослый интернет сделал за тебя домашку",
+                f"у тебя «{detail}» звучит как меню настроек перед переговорами с богом",
             ]
         result = self._choose_variant(variants, repository, recent_generated)
         selected = self.lexicon.select(
@@ -150,7 +232,7 @@ class LocalResponder:
             return "substantive_fallback"
         if re.search(r"(?:ахах|хаха|лол|кек|💀)", normalized):
             return "laugh"
-        if re.search(r"(?:долбо[её]б|лох|мудак|иди\s+нахуй|сам\s+ты)", normalized):
+        if re.search(r"(?:долбо[её]б|лох|мудак|охуел|иди\s+нахуй|сам\s+ты)", normalized):
             return "insult_to_chair" if re.search(r"(?:ты|стул|стульчик)", normalized) else "dismissal"
         if re.search(r"(?:ч[её]|в смысле|что)", normalized):
             return "confusion"
@@ -163,7 +245,8 @@ class LocalResponder:
     def respond(self, chat_id, text, intent, repository, excluded_meme_ids=(),
                 excluded_meme_groups=(), troll_mode=True, troll_intensity=.6,
                 behavior_mode="useful_answer", recent_generated=None,
-                stable_memories=None):
+                stable_memories=None, recent_dialogue=None, user_id=None,
+                username=None):
         if intent == SUBSTANTIVE and behavior_mode == "troll_user":
             return self._troll_user(
                 text, repository, excluded_meme_ids, excluded_meme_groups,
@@ -172,14 +255,6 @@ class LocalResponder:
         category = self._category(text, intent)
         normalized = normalize_spaces(text or "").casefold()
         if intent == SUBSTANTIVE:
-            if re.search(r"\bкак\s+набрать\s+вес\b", normalized):
-                return ((
-                    "начни с профицита 250–350 ккал, белка 1.6–2 г/кг и силовых с прогрессией; "
-                    "две недели вес стоит — добавь ещё 150–200 ккал, без массонабора в пельмень"
-                    if troll_mode else
-                    "начните с профицита 250–350 ккал, белка 1.6–2 г/кг и силовых с прогрессией; "
-                    "если две недели вес стоит, добавьте ещё 150–200 ккал"
-                ), ())
             if is_ambiguous_choice_request(normalized):
                 return (
                     "между чем выбираешь, лил бро" if troll_mode else "между чем выбираете?",
@@ -190,9 +265,20 @@ class LocalResponder:
             # subject or goal.
             if question_intent(normalized) == HOW_TO:
                 category = "how_to_unavailable"
-        variants = list(
-            RESPONSES[category] if troll_mode else NEUTRAL_RESPONSES[intent]
+        callback = self._contextual_callback(
+            text, stable_memories, recent_dialogue, user_id
         )
+        variants = self._composed_candidates(
+            text, intent, callback, troll_mode, username
+        )
+        if intent != SUBSTANTIVE and not callback:
+            variants.extend(self._history_pattern_candidates(text, recent_generated))
+        if category in {"summon", "laugh", "insult_to_chair", "confusion"}:
+            variants.extend(RESPONSES[category])
+        if category == "insult_to_chair" and troll_intensity > .6:
+            variants.append(f"ебать, {self._focus(text)} — аргумент века, обивка в панике")
+        if not troll_mode:
+            variants = list(NEUTRAL_RESPONSES[intent])
         if troll_mode and troll_intensity <= .4:
             # Low intensity stays the same character but does not randomly jump
             # to a high-intensity profanity variant.

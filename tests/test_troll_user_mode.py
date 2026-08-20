@@ -46,7 +46,7 @@ class TrollUserModeTests(unittest.TestCase):
 
     def service(self, roll, response="полезный ответ по существу", **settings):
         values = dict(data_dir=Path(self.temp.name), openai_chat_id=-42,
-                      min_training_messages=1, direct_social_markov_share=0)
+                      min_training_messages=1)
         values.update(settings)
         provider = Provider(response)
         service = LearningService(LearningSettings(**values), llm_provider=provider,

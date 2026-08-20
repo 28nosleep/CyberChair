@@ -1,6 +1,6 @@
-"""Provider-neutral text generation, validation and local fallback boundary.
+"""Provider-neutral text generation and validation boundary.
 
-This component owns provider/Markov generation mechanics.  It does not choose
+This component owns provider generation mechanics.  It does not choose
 Telegram delivery, route events, build ResponsePlans or commit persistent
 delivery state.
 """
@@ -8,12 +8,10 @@ delivery state.
 import hashlib
 import logging
 import re
-from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from .event_context import current_event_id, llm_network_call
-from .filters import similarity, validate_generated
-from .markov import MarkovModel
+from .filters import validate_generated
 from .preprocessing import normalize_spaces, rejection_reason
 
 
@@ -47,7 +45,7 @@ class GenerationCoordinator:
 
     def __init__(
         self, *, settings, repository, active_context_snapshot, memory,
-        local, quality_guard, lexical_diversity, persona, concurrency,
+        quality_guard, lexical_diversity, persona, concurrency,
         provider_for_chat, provider_name, injected_provider, troll_mode,
         planning_active, plan_persona_usage, llm_allowed_check, lock,
     ):
@@ -55,7 +53,6 @@ class GenerationCoordinator:
         self.repository = repository
         self._active_context_snapshot = active_context_snapshot
         self.memory = memory
-        self.local = local
         self.quality_guard = quality_guard
         self.lexical_diversity = lexical_diversity
         self.persona = persona
@@ -68,80 +65,11 @@ class GenerationCoordinator:
         self._plan_persona_usage = plan_persona_usage
         self.llm_allowed_check = llm_allowed_check
         self._lock = lock
-        self._models = OrderedDict()
-        self._model_counts = {}
-
     def invalidate_chat(self, chat_id):
-        with self._lock:
-            self._model_counts.pop(chat_id, None)
+        return None
 
     def forget_chat(self, chat_id):
-        with self._lock:
-            self._models.pop(chat_id, None)
-            self._model_counts.pop(chat_id, None)
-
-    def _markov_ready(self, chat_id):
-        snapshot = self._active_context_snapshot(chat_id)
-        count = (
-            snapshot.message_count
-            if snapshot is not None and snapshot.chat_id == int(chat_id)
-            else self.repository(chat_id).count()
-        )
-        return count >= self.settings.min_training_messages
-
-    def _model_and_messages(self, chat_id):
-        repository = self.repository(chat_id)
-        snapshot = self._active_context_snapshot(chat_id)
-        count = (
-            snapshot.message_count
-            if snapshot is not None and snapshot.chat_id == int(chat_id)
-            else repository.count()
-        )
-        messages = None
-        with self._lock:
-            if chat_id in self._models and self._model_counts.get(chat_id) == count:
-                model = self._models.pop(chat_id)
-                self._models[chat_id] = model
-            else:
-                messages = self._markov_corpus(repository)
-                model = MarkovModel().train([
-                    (row["text"], row["generation_weight"])
-                    for row in messages
-                ])
-                self._models[chat_id] = model
-                self._model_counts[chat_id] = count
-                while len(self._models) > self.settings.model_cache_size:
-                    old_chat, _ = self._models.popitem(last=False)
-                    self._model_counts.pop(old_chat, None)
-            if messages is None:
-                messages = self._markov_corpus(repository)
-        return model, messages
-
-    def _markov_corpus(self, repository, current=None):
-        """Build an age-tiered corpus without the live edge of the chat."""
-        rows = repository.meme_source_messages()
-        excluded = max(1, int(self.settings.markov_exclude_recent_messages))
-        rows = rows[:-excluded] if len(rows) > excluded else []
-        now = current or datetime.now(timezone.utc)
-        eligible = []
-        for row in rows:
-            created = self._as_utc(row.get("created_at"))
-            if created and (now - created).total_seconds() < self.settings.markov_min_message_age_seconds:
-                continue
-            eligible.append(dict(row))
-
-        recent_size = max(0, int(self.settings.markov_recent_history_size))
-        old_boundary = max(0, len(eligible) - recent_size)
-        for index, row in enumerate(eligible):
-            # Older language is the base corpus. Replied-to/local-meme-like rows
-            # get an extra vote; recently used sources lose that advantage.
-            weight = 3 if index < old_boundary else 1
-            if row.get("reply_count") or row.get("is_reply"):
-                weight += 2
-            if row.get("last_used_at"):
-                weight = max(1, weight - 2)
-            row["generation_weight"] = weight
-        return eligible
+        return None
 
     def _valid(self, text, input_text=None, source_texts=(), chat_id=None,
                max_words=None):
@@ -210,51 +138,6 @@ class GenerationCoordinator:
                 for key, value in events.items() if key.startswith("meme_caption_source_")
             },
         }
-
-    def generate_local(
-        self, chat_id, input_text=None, decorate=True, return_sources=False
-    ):
-        # A provider/admission waiter awakened by P2 must not manufacture a
-        # local fallback merely because the process entered DRAINING.
-        if self.concurrency.shutting_down:
-            return (None, ()) if return_sources else None
-        if not self._markov_ready(chat_id):
-            return (None, ()) if return_sources else None
-        model, messages = self._model_and_messages(chat_id)
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        snapshot = self._active_context_snapshot(chat_id)
-        rows = (
-            snapshot.recent_generated
-            if snapshot is not None and snapshot.chat_id == int(chat_id)
-            else self.repository(chat_id).generated_since(since)
-        )
-        previous = [
-            row["text"] for row in rows
-            if str(row.get("created_at") or "") >= since
-        ]
-        result, mode = self.local.create(model, messages, input_text, previous)
-        if not result:
-            log.info("Local generation failed chat=%s", chat_id)
-            return (None, ()) if return_sources else None
-        quality = self.quality_guard.check(result, previous[-40:], local=True)
-        if quality.lexical_phrases:
-            self.repository(chat_id).record_routing_event("lexical_penalty_triggered")
-        if not quality.accepted:
-            # One cheap local retry is allowed; this is not an LLM call.
-            result, mode = self.local.create(model, messages, input_text, previous)
-            if not result or not self.quality_guard.check(
-                result, previous[-40:], local=True
-            ).accepted:
-                return (None, ()) if return_sources else None
-        closest_sources = sorted(
-            (row["text"] for row in messages),
-            key=lambda source: similarity(result, source),
-            reverse=True,
-        )[:2]
-        if not return_sources:
-            self.repository(chat_id).mark_used(closest_sources)
-        log.info("Generation mode selected chat=%s mode=%s", chat_id, mode)
-        return (result, tuple(closest_sources)) if return_sources else result
 
     def llm_allowed(self, chat_id):
         allowed_chat = self.settings.openai_chat_id

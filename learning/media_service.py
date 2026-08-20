@@ -1,3 +1,4 @@
+import hashlib
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -75,6 +76,15 @@ class MediaService:
         scored = []
         for row in rows:
             if row.get("from_bot") or not row.get("file_id"):
+                continue
+            width, height = row.get("width"), row.get("height")
+            if row.get("file_size") and row["file_size"] > self.settings.max_chat_image_bytes:
+                continue
+            if width and height and (
+                min(width, height) < 96
+                or max(width, height) > self.settings.max_chat_image_dimension
+                or width * height > self.settings.max_chat_image_pixels
+            ):
                 continue
             created = self._as_utc(row.get("created_at"))
             age_days = (current - created).total_seconds() / 86400 if created else 3650
@@ -158,12 +168,14 @@ class MediaService:
         elif state.conversation_type == "argument":
             chance += self.settings.media_argument_bonus
         elif state.conversation_type == "serious":
-            chance *= .25
+            chance *= .18
         elif state.conversation_type == "work":
-            chance *= .75
+            chance *= .55
         if state.activity_level == "burst":
-            chance += .03
-        return max(0.0, min(.45, chance))
+            chance += .06
+        elif state.activity_level == "low":
+            chance *= .65
+        return max(0.0, min(.50, chance))
 
     def _quote(self, rows, target_message_id):
         user_rows = [
@@ -245,6 +257,7 @@ class MediaService:
         signals.add(state.conversation_type)
         signals.add(decision.preferred_style)
         recent_assets = {row["asset_key"] for row in recent}
+        recent_types = [row.get("action") for row in recent[:4]]
         scored = []
         for kind, enabled in (("gif", self.settings.gif_enabled), ("sticker", self.settings.sticker_enabled)):
             if not enabled:
@@ -263,7 +276,8 @@ class MediaService:
                     # Equal contextual matches used to prefer "sticker" only
                     # because it sorts after "gif" lexicographically.
                     kind_bias = 1 if kind == "gif" else 0
-                    scored.append((overlap, kind_bias, row.get("last_used_at") is None, key, kind, row))
+                    type_penalty = recent_types.count(kind) * 1.5
+                    scored.append((overlap - type_penalty, kind_bias, row.get("last_used_at") is None, key, kind, row))
         if not scored:
             return None
         _, _, _, key, kind, row = sorted(scored, reverse=True)[0]
@@ -280,6 +294,11 @@ class MediaService:
         if len(normalize_memory(text).split()) < 2:
             return None
         gif_share = max(0.0, min(1.0, self.settings.media_gif_share))
+        recent_types = [row.get("action") for row in recent[:3]]
+        if recent_types and recent_types[0] == "gif":
+            gif_share *= .45
+        elif recent_types and recent_types[0] == "sticker":
+            gif_share = min(.90, gif_share + .18)
         first = "gif" if roll < gif_share else "sticker"
         order = (first, "sticker" if first == "gif" else "gif")
         recent_assets = {row["asset_key"] for row in recent}
@@ -340,6 +359,32 @@ class MediaService:
                 templates = []
             else:
                 confidence = min(.98, .5 + templates[0][0] / 10)
+                ranked_images = self.score_chat_images(
+                    repository, text, conversation_decision.target_user_id
+                )
+                image = ranked_images[0] if ranked_images else None
+                use_chat_image = bool(
+                    image and self.rng.random() < self.settings.automatic_chat_image_chance
+                )
+                if use_chat_image:
+                    profile = self.rng.choice((
+                        "top_caption", "bottom_caption", "center",
+                        "top_bottom", "top_center", "center_bottom",
+                    ))
+                    return MediaDecision(
+                        action="meme", source_message_id=source_id,
+                        caption_text=quote, confidence=confidence,
+                        reason="contextual_chat_image",
+                        asset_key=f"chat_image:{image['file_unique_id']}",
+                        cooldown_group="chat_image", archetype="chat_image",
+                        background_file_id=image["file_id"],
+                        background_file_unique_id=image["file_unique_id"],
+                        background_media_type=image["media_type"],
+                        background_mime_type=image.get("mime_type"),
+                        background_user_id=image.get("user_id"),
+                        background_message_id=image.get("message_id"),
+                        render_profile=profile,
+                    )
                 return MediaDecision(
                     "meme", asset.id, asset.id, source_id, quote,
                     confidence, f"contextual_template:{asset.cooldown_group}",
@@ -376,3 +421,11 @@ class MediaService:
             )),
             archetype=decision.archetype or (asset.archetype if asset else decision.action),
         )
+        if decision.background_file_unique_id and decision.caption_text:
+            caption_hash = hashlib.sha256(
+                decision.caption_text.casefold().encode("utf-8")
+            ).hexdigest()[:20]
+            repository.mark_chat_image_used(
+                decision.background_file_unique_id, caption_hash,
+                decision.background_user_id,
+            )

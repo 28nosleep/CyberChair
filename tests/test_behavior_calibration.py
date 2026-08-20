@@ -18,7 +18,6 @@ from learning import (
     PersonaBuilder,
 )
 from learning.filters import similarity, validate_generated
-from learning.markov import MarkovModel
 from learning.meme_sources import MemeSource
 from learning.repository import ChatRepository
 
@@ -184,15 +183,12 @@ class BehaviorCalibrationTests(unittest.TestCase):
         service = LearningService(self.settings(), rng=FixedRandom(.32))
         with (
             patch.object(service, "generate_llm") as ai,
-            patch.object(service, "generate_local") as markov,
         ):
             self.assertIsNone(service.maybe_stul_cooldown_reply(message("стул")))
         ai.assert_not_called()
-        markov.assert_not_called()
         self.assertLess(
-            (service.settings.reply_to_stul_chance + service.settings.stul_markov_reply_chance)
-            * service.settings.bare_stul_reply_factor,
-            service.settings.reply_to_stul_chance + service.settings.stul_markov_reply_chance,
+            service.settings.reply_to_stul_chance * service.settings.bare_stul_reply_factor,
+            service.settings.reply_to_stul_chance,
         )
 
     def test_substantive_chair_request_keeps_normal_ai_path(self):
@@ -200,57 +196,10 @@ class BehaviorCalibrationTests(unittest.TestCase):
         incoming = message("стул как приготовить курицу сувид")
         with (
             patch.object(service, "generate_llm", return_value="63–65 градусов, потом быстро обжарь") as ai,
-            patch.object(service, "generate_local") as markov,
         ):
             result = service.maybe_stul_cooldown_reply(incoming)
         self.assertIn("63", result)
         ai.assert_called_once()
-        markov.assert_not_called()
-
-    def test_markov_corpus_excludes_live_edge_and_very_recent_rows(self):
-        service = LearningService(self.settings(
-            markov_exclude_recent_messages=3,
-            markov_min_message_age_seconds=120,
-            markov_recent_history_size=2,
-        ))
-        repository = service.repository(-1)
-        now = datetime.now(timezone.utc)
-        for index in range(1, 6):
-            repository.add_message(
-                index, 7, None, f"старая локальная фраза номер {index}",
-                now - timedelta(days=2, minutes=index),
-            )
-        repository.add_message(6, 7, None, "слишком свежая фраза не для маркова", now)
-        for index in range(7, 10):
-            repository.add_message(
-                index, 7, None, f"последнее сообщение live edge {index}",
-                now - timedelta(days=2),
-            )
-        corpus = service.generation._markov_corpus(repository, current=now)
-        texts = [row["text"] for row in corpus]
-        self.assertEqual(len(texts), 5)
-        self.assertNotIn("слишком свежая фраза не для маркова", texts)
-        self.assertFalse(any("live edge" in text for text in texts))
-        self.assertGreater(corpus[0]["generation_weight"], corpus[-1]["generation_weight"])
-
-    def test_markov_model_never_learns_excluded_recent_phrase(self):
-        service = LearningService(self.settings(markov_exclude_recent_messages=3))
-        repository = service.repository(-1)
-        old = datetime.now(timezone.utc) - timedelta(days=1)
-        for index, text in enumerate((
-            "старый мем про сервер который живёт своей жизнью",
-            "старый мем про релиз который опять убежал",
-            "старый мем про созвон который никто не просил",
-            "уникальная свежая последовательность один два три",
-            "уникальная свежая последовательность четыре пять шесть",
-            "уникальная свежая последовательность семь восемь девять",
-        ), 1):
-            repository.add_message(index, 7, None, text, old)
-        model, _ = service.generation._model_and_messages(-1)
-        learned = " ".join(
-            word for options in model.transitions.values() for word in options
-        ).casefold()
-        self.assertNotIn("свежая", learned)
 
     def test_normalized_similarity_penalizes_near_repeats(self):
         source = "сервер опять упал после пятничного релиза"
@@ -261,15 +210,13 @@ class BehaviorCalibrationTests(unittest.TestCase):
             "bot_copy",
         )
 
-    def test_ai_event_never_calls_markov_and_failed_meme_ai_uses_local_without_second_llm(self):
+    def test_ai_event_and_failed_meme_ai_use_no_second_llm(self):
         service = LearningService(self.settings(), rng=FixedRandom(.05))
         with (
             patch.object(service, "generate_llm", return_value="один ответ") as ai,
-            patch.object(service, "generate_local") as markov,
         ):
             self.assertEqual(service.maybe_stul_cooldown_reply(message("стул")), "один ответ")
         ai.assert_called_once()
-        markov.assert_not_called()
 
         with (
             patch.object(service, "provider_available", return_value=True),

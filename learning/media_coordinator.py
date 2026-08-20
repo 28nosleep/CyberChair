@@ -7,6 +7,7 @@ algorithms.
 
 import hashlib
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from .event_context import current_event, implicit_event_id
@@ -31,7 +32,7 @@ class MediaCoordinator:
         self, *, settings, repository, normalize_event, active_snapshot,
         media, media_catalog, meme_renderer, meme_sources, quality_guard,
         memory, persona, rng, concurrency, activity_allows, media_enabled,
-        troll_mode, provider_available, generate_llm, generate_local,
+        troll_mode, provider_available, generate_llm,
         command_meme_sources, lock, photo_meme_caption_re,
     ):
         self.settings=settings
@@ -52,7 +53,6 @@ class MediaCoordinator:
         self.troll_mode=troll_mode
         self.provider_available=provider_available
         self.generate_llm=generate_llm
-        self.generate_local=generate_local
         self._command_meme_sources=command_meme_sources
         self._lock=lock
         self._photo_meme_caption_re=photo_meme_caption_re
@@ -61,7 +61,7 @@ class MediaCoordinator:
 
     def bind_runtime_ports(
         self, *, activity_allows, media_enabled, troll_mode,
-        provider_available, generate_llm, generate_local, meme_cooldown,
+        provider_available, generate_llm, meme_cooldown,
         local_caption,
     ):
         """Refresh injected facade ports without taking a service back-reference."""
@@ -70,7 +70,6 @@ class MediaCoordinator:
         self.troll_mode = troll_mode
         self.provider_available = provider_available
         self.generate_llm = generate_llm
-        self.generate_local = generate_local
         self._meme_cooldown = meme_cooldown
         self._local_caption = local_caption
 
@@ -339,6 +338,14 @@ class MediaCoordinator:
             and (explicit_image.get("file_size") or 0) <= self.settings.max_chat_image_bytes
             and max(explicit_image.get("width") or 0, explicit_image.get("height") or 0)
                 <= self.settings.max_chat_image_dimension
+            and (
+                not explicit_image.get("width") or not explicit_image.get("height")
+                or (
+                    min(explicit_image["width"], explicit_image["height"]) >= 96
+                    and explicit_image["width"] * explicit_image["height"]
+                        <= self.settings.max_chat_image_pixels
+                )
+            )
         )
         # A reply to a non-image/bot image is an explicit but unusable choice:
         # safely fall back to curated media rather than substituting an unrelated
@@ -367,9 +374,21 @@ class MediaCoordinator:
             and self.provider_available(chat_id)
             and not self._meme_cooldown(chat_id)
         )
-        source = self.meme_sources.choose(
-            chat_id, rows, callbacks, current_text=background_context,
-            topic=hint, fallback=not ai_ready
+        explicit_caption = normalize_spaces(
+            (explicit_image or {}).get("caption", "")
+        )
+        if caption_match:
+            explicit_caption = ""
+        source = (
+            MemeSource(
+                "fresh", explicit_caption,
+                (explicit_image or {}).get("message_id"),
+                (explicit_image or {}).get("user_id"),
+            )
+            if explicit_caption else self.meme_sources.choose(
+                chat_id, rows, callbacks, current_text=background_context,
+                topic=hint, fallback=not ai_ready
+            )
         )
         caption = None
         caption_source = None
@@ -383,8 +402,16 @@ class MediaCoordinator:
                 ) if value)
             ) or None
             caption = self.generate_llm(chat_id, context, "meme_caption")
-            if caption:
+            grounding = tuple(value for value in (
+                hint,
+                (explicit_image or {}).get("caption", ""),
+                source.text,
+            ) if normalize_spaces(value))
+            if caption and self._caption_grounded(caption, grounding):
                 caption_source = "ai"
+            elif caption:
+                repository.record_routing_event("meme_caption_grounding_rejected")
+                caption = None
         if not caption:
             # A failed/incomplete/invalid AI caption may use one local fallback;
             # this never performs a second LLM call and still has one final meme.
@@ -415,7 +442,10 @@ class MediaCoordinator:
                     )
                 ), None)
         if image is not None:
-            profile = self.rng.choice(("top_caption", "bottom_caption", "top_bottom"))
+            profile = self.rng.choice((
+                "top_caption", "bottom_caption", "center", "top_bottom",
+                "top_center", "center_bottom",
+            ))
             values = base.debug()
             values.update({
                 "background_file_id": image["file_id"],
@@ -447,24 +477,6 @@ class MediaCoordinator:
         """One ready local fallback; it never chains into another producer."""
         if source.kind in {"old", "fresh", "callback"} and source.text:
             return source, self._caption_from_source(source)
-        if self.meme_sources.markov_allowed(chat_id):
-            generated = self.generate_local(chat_id)
-            if isinstance(generated, str) and generated:
-                candidate = MemeSource("markov", generated)
-                quality = self.quality_guard.check(
-                    generated,
-                    (
-                        list(snapshot.recent_generated_texts[-40:])
-                        if snapshot is not None
-                        else [
-                            row["text"]
-                            for row in self.repository(chat_id).recent_generated(40)
-                        ]
-                    ),
-                    local=True, image_meme=True,
-                )
-                if quality.accepted:
-                    return candidate, self._caption_from_source(candidate)
         # Last resort is still a real chat utterance, never a phrase bank.
         for row in reversed(rows):
             text = normalize_spaces(row.get("text", ""))
@@ -476,9 +488,33 @@ class MediaCoordinator:
         return MemeSource("none", ""), None
 
     def _caption_from_source(self, source):
-        # Quotes/callbacks/Markov are the caption itself. Appending a stock tail
+        # Quotes/callbacks are the caption itself. Appending a stock tail
         # turns real chat history back into a visible canned phrase bank.
         return normalize_spaces(source.text)[:110]
+
+    @staticmethod
+    def _caption_grounded(caption, source_lines):
+        """Allow shortening/reordering, reject a newly invented meme premise."""
+        def tokens(value):
+            return {
+                word.replace("ё", "е") for word in re.findall(
+                    r"[а-яёa-z0-9]+", normalize_spaces(value).casefold()
+                ) if len(word) >= 3
+            }
+        output = tokens(caption)
+        supplied = tokens(" ".join(source_lines))
+        harmless = {"опять", "снова", "когда", "просто", "этот", "эта", "это"}
+        meaningful = output - harmless
+        if not meaningful or not supplied:
+            return False
+        grounded = sum(
+            any(
+                word == source or (
+                    min(len(word), len(source)) >= 5 and word[:5] == source[:5]
+                ) for source in supplied
+            ) for word in meaningful
+        )
+        return grounded / len(meaningful) >= .85
 
     def mark_command_meme_sent(self, chat_id, decision):
         if not isinstance(decision, MediaDecision):
@@ -486,15 +522,6 @@ class MediaCoordinator:
         repository = self.repository(chat_id)
         self.media.commit(repository, decision)
         repository.record_generated(decision.template_id or "manual_meme", "manual_meme")
-        if decision.background_file_unique_id:
-            caption_hash = hashlib.sha256(
-                (decision.caption_text or "").casefold().encode("utf-8")
-            ).hexdigest()[:20]
-            repository.mark_chat_image_used(
-                decision.background_file_unique_id,
-                caption_hash,
-                decision.background_user_id,
-            )
         with self._lock:
             source = self._command_meme_sources.pop(
                 decision,
@@ -506,7 +533,7 @@ class MediaCoordinator:
         reason_source = (decision.reason or "").removeprefix("manual_local_").removeprefix("manual_")
         source_name = {
             "old": "historical_quote", "fresh": "recent_quote",
-            "callback": "callback", "markov": "markov", "ai": "ai",
+            "callback": "callback", "ai": "ai",
         }.get(reason_source, source.kind)
         repository.record_routing_event(f"meme_caption_source_{source_name}")
         if source.kind in {"old", "fresh"} and source.text:

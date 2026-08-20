@@ -14,12 +14,12 @@ class R2ProductionLikeFailureSmokeTests(unittest.TestCase):
     def test_one_hundred_mixed_events_keep_success_state_transport_truthful(self):
         categories = (
             "direct_useful", "troll_user", "local", "pending", "ordinary",
-            "markov", "gif", "sticker", "meme", "photo_caption_meme",
+            "free_contextual", "gif", "sticker", "meme", "photo_caption_meme",
             "provider_fallback",
         )
         producers = (
             Producer.LLM, Producer.LLM, Producer.LOCAL, Producer.LOCAL,
-            Producer.LLM, Producer.MARKOV, Producer.MEDIA, Producer.MEDIA,
+            Producer.LLM, Producer.LOCAL, Producer.MEDIA, Producer.MEDIA,
             Producer.MEME, Producer.MEME, Producer.LOCAL,
         )
         rows = []

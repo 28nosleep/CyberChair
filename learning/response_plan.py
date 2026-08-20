@@ -11,7 +11,6 @@ from .media_service import MediaDecision
 class Producer(str, Enum):
     LLM = "llm"
     LOCAL = "local"
-    MARKOV = "markov"
     MEDIA = "media"
     MEME = "meme"
     SYSTEM = "system"

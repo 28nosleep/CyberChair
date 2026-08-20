@@ -177,17 +177,15 @@ class ChatImageMemeSelectionTests(unittest.TestCase):
         self.assertIsNone(curated.background_file_id)
         self.assertIsNotNone(curated.template_id)
 
-    def test_cooldown_keeps_explicit_image_and_uses_no_ai_or_markov(self):
+    def test_cooldown_keeps_explicit_image_and_uses_no_ai(self):
         reply = image_message(10, [photo("chosen", "chosen-u", 800, 600)])
         with (
             patch.object(self.service, "generate_llm") as ai,
-            patch.object(self.service, "generate_local") as markov,
         ):
             decision = self.service.maybe_command_meme(command(reply))
         self.assertEqual(decision.background_file_id, "chosen")
         self.assertTrue(decision.reason.startswith("manual_local_"))
         ai.assert_not_called()
-        markov.assert_not_called()
 
     def test_hint_is_passed_into_single_ai_caption_context(self):
         reply = image_message(

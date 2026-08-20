@@ -64,7 +64,7 @@ class ChatActionTests(unittest.TestCase):
         service = LearningService(
             LearningSettings(
                 data_dir=Path(self.temp.name), openai_chat_id=-1,
-                min_training_messages=20, direct_social_markov_share=0,
+                min_training_messages=20,
             ),
             llm_provider=provider,
             rng=rng or FixedRandom(),

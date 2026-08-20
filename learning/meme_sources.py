@@ -27,7 +27,7 @@ class MemeSourceSelector:
     """Choose varied meme material, preferring actual chat quotes."""
 
     WEIGHTS = (("fresh", 45), ("old", 35), ("callback", 20))
-    FALLBACK_ORDER = ("old", "fresh", "callback", "markov")
+    FALLBACK_ORDER = ("old", "fresh", "callback")
 
     def __init__(self, rng, recent_limit=8):
         self.rng = rng
@@ -125,10 +125,6 @@ class MemeSourceSelector:
     def recent_templates(self, chat_id):
         with self._lock:
             return set(self._templates[chat_id])
-
-    def markov_allowed(self, chat_id):
-        with self._lock:
-            return "markov" not in self._kinds[chat_id]
 
     def clear_chat(self, chat_id):
         with self._lock:

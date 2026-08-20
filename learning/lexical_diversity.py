@@ -14,6 +14,11 @@ CONSTRUCTIONS = (
     ("chairOS фиксирует", re.compile(r"\bchairos\s+фиксирует\b", re.I)),
     ("ебать ты", re.compile(r"\bебать\s+ты\b", re.I)),
 )
+OVERUSED_EXPRESSIONS = {
+    "классика": re.compile(r"\b(?:ну\s+)?классик(?:а|ой|у|е|и)?\b", re.I),
+    "chairOS": re.compile(r"\bchairos\b", re.I),
+    "цель обнаружена": re.compile(r"\bцель\s+обнаружена\b", re.I),
+}
 
 
 @dataclass(frozen=True)
@@ -46,19 +51,30 @@ class LexicalDiversityTracker:
         for word in words:
             if self._noticeable_word(word):
                 phrases.add(word)
-        for size in (2, 3):
+        for size in (2, 3, 4):
             for index in range(max(0, len(words) - size + 1)):
                 gram = words[index:index + size]
-                if sum(self._noticeable_word(word) for word in gram) >= 1:
+                if any(self._noticeable_word(word) for word in gram):
                     phrases.add(" ".join(gram))
         openings = {
             " ".join(words[:size]) for size in (1, 2, 3)
-            if len(words) >= size and any(self._noticeable_word(word) for word in words[:size])
+            if len(words) >= size and (
+                any(self._noticeable_word(word) for word in words[:size])
+                or (
+                    size >= 2
+                    and " ".join(words[:size]) in {
+                        "ну да", "ну и", "вот и", "если кратко"
+                    }
+                )
+            )
         }
         phrases.update(openings)
         for label, pattern in CONSTRUCTIONS:
             if pattern.search(clean):
                 phrases.add(label)
+        for label, pattern in OVERUSED_EXPRESSIONS.items():
+            if pattern.search(clean):
+                phrases.add(label.casefold())
         return phrases, openings
 
     def penalties(self, recent_texts):
@@ -74,9 +90,15 @@ class LexicalDiversityTracker:
                 opening_counts[phrase] += weight
         result = []
         for phrase, count in counts.items():
-            if count < 1.55:
+            sticky = phrase in {key.casefold() for key in OVERUSED_EXPRESSIONS}
+            if count < (0.35 if sticky else 1.55):
                 continue
-            penalty = (count - 1.0) * (2.0 if count >= self.strong_count - .25 else .8)
+            penalty = (
+                5.0 + count * 2.5 if sticky
+                else (count - 1.0) * (
+                    2.0 if count >= self.strong_count - .25 else .8
+                )
+            )
             if phrase in opening_counts:
                 penalty *= 1.35
             result.append(LexicalPenalty(phrase, round(count), penalty, phrase in opening_counts))

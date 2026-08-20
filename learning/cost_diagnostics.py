@@ -42,7 +42,7 @@ def format_direct_report(events, usage_report):
     received = events.get("direct_addresses", 0) + events.get("direct_replies", 0)
     routes = {
         name: events.get(f"route_{name}", 0)
-        for name in ("local", "gif", "sticker", "markov", "meme")
+        for name in ("local", "gif", "sticker", "meme")
     }
     routes["llm"] = events.get("route_llm", 0) + events.get("route_grok", 0)
     answered = sum(routes.values())

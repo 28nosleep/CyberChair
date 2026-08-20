@@ -9,7 +9,7 @@ SIDE_EFFECT_MATRIX = (
     ("trivial_local", "text", "route/generated/policy target", "pending bot id attach", "phantom generated"),
     ("pending_continuation", "text", "pending delete/route/generated", "none", "pending lost"),
     ("ordinary_ai", "text", "trigger/generated/policy target", "none", "phantom generated/cooldown"),
-    ("ordinary_markov", "text", "trigger/generated/policy target/source use", "none", "phantom generated/cooldown"),
+    ("ordinary_free", "text", "trigger/generated/policy target", "none", "phantom generated/cooldown"),
     ("contextual_gif", "animation", "trigger/media usage/generated", "none", "phantom media usage"),
     ("contextual_sticker", "sticker", "trigger/media usage/generated", "none", "phantom media usage"),
     ("contextual_meme", "photo", "trigger/media usage/generated", "temp cleanup", "usage committed despite failure"),
@@ -27,7 +27,7 @@ class R2SideEffectCharacterizationTests(unittest.TestCase):
     def test_current_side_effect_matrix_is_complete(self):
         expected = {
             "direct_useful", "direct_troll_user", "trivial_local",
-            "pending_continuation", "ordinary_ai", "ordinary_markov",
+            "pending_continuation", "ordinary_ai", "ordinary_free",
             "contextual_gif", "contextual_sticker", "contextual_meme",
             "manual_meme_text", "manual_meme_photo", "manual_meme_reply",
             "autonomous_text", "autonomous_media", "scheduled_utility",

@@ -1,6 +1,14 @@
 import re
 
 URL_RE = re.compile(r"(?:https?://|www\.)\S+|(?:t\.me/\S+)", re.I)
+# Telegram users sometimes paste a URL with its separators replaced by spaces,
+# e.g. ``https www instagram com reel ...``.  It is still link-only content
+# for the bot, even though it is not a syntactically valid URL.
+OBFUSCATED_URL_RE = re.compile(
+    r"(?<!\w)(?:https?|www)\s+(?:[a-z0-9-]+\s+){1,3}"
+    r"(?:com|net|org|ru|io|app|dev|me|tv|gg|co|info|biz)\b",
+    re.I,
+)
 EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d ()-]{8,}\d)(?!\w)")
 TOKEN_RE = re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}\b")
@@ -27,6 +35,12 @@ def normalize_spaces(text):
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def contains_link(text):
+    """Return whether text contains a normal or deliberately spaced URL."""
+    clean = normalize_spaces(text)
+    return bool(URL_RE.search(clean) or OBFUSCATED_URL_RE.search(clean))
+
+
 def rejection_reason(text, max_length=2000):
     clean = normalize_spaces(text)
     if not clean:
@@ -39,7 +53,7 @@ def rejection_reason(text, max_length=2000):
         return "too_long"
     if ONLY_EMOJI_RE.fullmatch(clean):
         return "emoji_only"
-    if ONLY_LINK_RE.fullmatch(clean) or URL_RE.search(clean):
+    if ONLY_LINK_RE.fullmatch(clean) or contains_link(clean):
         return "link"
     if EMAIL_RE.search(clean):
         return "email"

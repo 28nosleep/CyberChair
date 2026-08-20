@@ -271,18 +271,14 @@ class CharacterizationTests(unittest.TestCase):
     def test_openai_failure_returns_none_without_local_fallback(self):
         client = SimpleNamespace(responses=FailingResponses())
         service = LearningService(self.settings(), openai_client=client)
-        with patch.object(service, "generate_local") as local:
-            self.assertIsNone(service.generate_llm(-1, "ответь на вопрос", "reply"))
-        local.assert_not_called()
+        self.assertIsNone(service.generate_llm(-1, "ответь на вопрос", "reply"))
 
-    def test_local_generation_uses_only_local_generator(self):
+    def test_free_response_uses_no_llm(self):
         service = LearningService(self.settings(), rng=FixedRandom())
         service.ingest(message(-1, 10, "исходное нормальное сообщение для модели"))
-        with (
-            patch.object(service.local, "create", return_value=("локальный нормальный ответ", "markov")),
-            patch.object(service.llm_provider, "generate") as llm_generate,
-        ):
-            self.assertEqual(service.generate_local(-1), "локальный нормальный ответ")
+        with patch.object(service.llm_provider, "generate") as llm_generate:
+            result = service.generate_free_response(-1, "релиз опять упал")
+        self.assertIn("релиз", result)
         llm_generate.assert_not_called()
 
     def test_existing_hour_limit_blocks_after_configured_count(self):

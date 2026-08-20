@@ -164,13 +164,12 @@ class LearningSettings:
     # Applied locally only to explicitly addressed substantive turns while
     # TrollMode is enabled. Kept in config so it can later become per-chat UI.
     troll_user_probability: float = field(default_factory=lambda: _float("TROLL_USER_PROBABILITY", 0.50))
-    stul_markov_reply_chance: float = field(default_factory=lambda: _float("STUL_MARKOV_REPLY_CHANCE", 0.50))
-    frequent_stul_markov_chance: float = field(default_factory=lambda: _float("FREQUENT_STUL_MARKOV_CHANCE", 0.80))
     # A bare invocation is much weaker than an addressed question. Keep this
     # separate from the global activity and addressed-reply controls.
     bare_stul_reply_factor: float = field(default_factory=lambda: _float("BARE_STUL_REPLY_FACTOR", 0.35))
     creator_username: str = field(default_factory=lambda: os.getenv("CREATOR_USERNAME", "sssssssssssssss28").strip().lstrip("@").casefold())
-    sglypa_reply_chance: float = field(default_factory=lambda: _float("SGLYPA_REPLY_CHANCE", 0.375))
+    sglypa_reply_chance: float = field(default_factory=lambda: _float("SGLYPA_REPLY_CHANCE", 0.12))
+    sglypa_reply_cooldown: int = field(default_factory=lambda: _int("SGLYPA_REPLY_COOLDOWN", 1800))
     trigger_reaction_chance: float = field(default_factory=lambda: _float("TRIGGER_REACTION_CHANCE", 0.08))
     trigger_reaction_cooldown: int = field(default_factory=lambda: _int("TRIGGER_REACTION_COOLDOWN", 1800))
     max_generated_words: int = field(default_factory=lambda: _int("MAX_GENERATED_WORDS", 35))
@@ -196,10 +195,6 @@ class LearningSettings:
     summary_message_interval: int = field(default_factory=lambda: _int("SUMMARY_MESSAGE_INTERVAL", 50))
     summary_time_interval: int = field(default_factory=lambda: _int("SUMMARY_TIME_INTERVAL", 1200))
     max_long_memories: int = field(default_factory=lambda: _int("MAX_LONG_MEMORIES", 40))
-    model_cache_size: int = field(default_factory=lambda: _int("MODEL_CACHE_SIZE", 20))
-    markov_exclude_recent_messages: int = field(default_factory=lambda: _int("MARKOV_EXCLUDE_RECENT_MESSAGES", 3))
-    markov_min_message_age_seconds: int = field(default_factory=lambda: _int("MARKOV_MIN_MESSAGE_AGE_SECONDS", 120))
-    markov_recent_history_size: int = field(default_factory=lambda: _int("MARKOV_RECENT_HISTORY_SIZE", 10))
     max_stored_text_length: int = field(default_factory=lambda: _int("MAX_STORED_TEXT_LENGTH", 2000))
     allow_user_mentions: bool = field(default_factory=lambda: _bool("ALLOW_USER_MENTIONS", False))
     quiet_start_hour: int = field(default_factory=lambda: _int("QUIET_START_HOUR", 23))
@@ -252,13 +247,12 @@ class LearningSettings:
     # Zero disables the soft budget. It is intentionally priority-aware: P1/P2
     # stay local while useful P3 questions may still use the configured model.
     xai_daily_chat_budget_usd: float = field(default_factory=lambda: _float("XAI_DAILY_CHAT_BUDGET_USD", 0.0))
-    direct_social_markov_share: float = field(default_factory=lambda: _float("DIRECT_SOCIAL_MARKOV_SHARE", 0.12))
     gif_enabled: bool = field(default_factory=lambda: _bool("GIF_ENABLED", True))
     max_gifs_per_chat: int = field(default_factory=lambda: _int("MAX_GIFS_PER_CHAT", 1000))
     sticker_enabled: bool = field(default_factory=lambda: _bool("STICKER_ENABLED", True))
     max_stickers_per_chat: int = field(default_factory=lambda: _int("MAX_STICKERS_PER_CHAT", 1000))
-    media_reply_chance: float = field(default_factory=lambda: _float("MEDIA_REPLY_CHANCE", 0.18))
-    media_humor_bonus: float = field(default_factory=lambda: _float("MEDIA_HUMOR_BONUS", 0.14))
+    media_reply_chance: float = field(default_factory=lambda: _float("MEDIA_REPLY_CHANCE", 0.22))
+    media_humor_bonus: float = field(default_factory=lambda: _float("MEDIA_HUMOR_BONUS", 0.16))
     media_argument_bonus: float = field(default_factory=lambda: _float("MEDIA_ARGUMENT_BONUS", 0.08))
     media_meme_chance: float = field(default_factory=lambda: _float("MEDIA_MEME_CHANCE", 0.55))
     media_gif_share: float = field(default_factory=lambda: _float("MEDIA_GIF_SHARE", 0.72))
@@ -267,6 +261,7 @@ class LearningSettings:
     media_template_cooldown: int = field(default_factory=lambda: _int("MEDIA_TEMPLATE_COOLDOWN", 3600))
     manual_meme_cooldown: int = field(default_factory=lambda: _int("MANUAL_MEME_COOLDOWN", 120))
     chat_image_background_chance: float = field(default_factory=lambda: _float("CHAT_IMAGE_BACKGROUND_CHANCE", 0.35))
+    automatic_chat_image_chance: float = field(default_factory=lambda: _float("AUTOMATIC_CHAT_IMAGE_CHANCE", 0.78))
     max_chat_images_per_chat: int = field(default_factory=lambda: _int("MAX_CHAT_IMAGES_PER_CHAT", 2000))
     max_chat_image_bytes: int = field(default_factory=lambda: _int("MAX_CHAT_IMAGE_BYTES", 20 * 1024 * 1024))
     max_chat_image_dimension: int = field(default_factory=lambda: _int("MAX_CHAT_IMAGE_DIMENSION", 12000))
@@ -279,13 +274,6 @@ class LearningSettings:
         for phrase in os.getenv("SPECIAL_PHRASES", "сглыпа стул,киберстул").split(",")
         if phrase.strip()
     ))
-    mode_weights: dict = field(default_factory=lambda: {
-        "markov": _float("MODE_MARKOV_WEIGHT", 0.42),
-        "combine": _float("MODE_COMBINE_WEIGHT", 0.18),
-        "quote_mutation": _float("MODE_QUOTE_MUTATION_WEIGHT", 0.16),
-        "contextual": _float("MODE_CONTEXTUAL_WEIGHT", 0.20),
-        "random_old_phrase": _float("MODE_RANDOM_OLD_PHRASE_WEIGHT", 0.04),
-    })
     data_dir: Path = field(default_factory=_data_dir)
     llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "grok"))
     timezone_name: str = field(default_factory=_timezone_name)

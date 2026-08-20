@@ -113,9 +113,7 @@ class ChatActionManager:
         if producer == "llm" or self._shutdown.is_set():
             return
         words = len(str(text or "").split())
-        if producer == "markov":
-            low, high = 0.7, 1.5
-        elif words <= 3:
+        if words <= 3:
             low, high = 0.4, 1.2
         else:
             low, high = 0.8, 1.8

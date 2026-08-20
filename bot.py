@@ -52,7 +52,11 @@ from learning import (
     Producer,
     ResponsePlan,
 )
-from learning.preprocessing import FOREIGN_BOT_COMMAND_RE, VOICE_STORY_COMMAND_RE
+from learning.preprocessing import (
+    FOREIGN_BOT_COMMAND_RE,
+    VOICE_STORY_COMMAND_RE,
+    contains_link,
+)
 from learning.response_plan import GeneratedCommit, SourceUsageCommit
 from learning.event_context import current_event_id
 from learning.normalized_event import (
@@ -189,6 +193,7 @@ def deliver_response_plan(plan, message=None):
             "DELIVERY_ATTEMPT_TELEMETRY_FAILED event_id=%s", plan.event_id
         )
     rendered = None
+    source_path = None
     try:
         reply_to = plan.reply_to_message_id
         if plan.delivery_type == DeliveryType.TEXT:
@@ -216,8 +221,11 @@ def deliver_response_plan(plan, message=None):
         elif plan.delivery_type == DeliveryType.PHOTO:
             path = plan.payload.prepared_path
             if path is None:
+                decision = plan.payload.decision
+                if decision.background_file_id:
+                    source_path = download_chat_image(decision.background_file_id)
                 rendered = learning_service.render_meme(
-                    plan.payload.decision,
+                    decision, source_path,
                     background=plan.purpose.startswith("autonomous"),
                 )
                 path = getattr(rendered, "path", None)
@@ -264,6 +272,11 @@ def deliver_response_plan(plan, message=None):
     finally:
         if rendered is not None:
             learning_service.cleanup_rendered_meme(rendered)
+        if source_path is not None:
+            try:
+                Path(source_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def execute_response_plan(plan, message=None):
@@ -283,7 +296,6 @@ last_sglypa_reply_at = 0
 last_trigger_reply_at = {}
 last_freekucher_reply_at = {}
 
-SGLYPA_REPLY_COOLDOWN = 15
 SGLYPA_USERNAME = "sglypa_tg_bot"
 FREEKUCHER_REPLY_COOLDOWN = 60
 CHAIR_REMAINING_COMMAND_RE = re.compile(r"^\s*с\s+стул\s*$", re.IGNORECASE)
@@ -613,7 +625,7 @@ def sglypa_reaction(message, event=None):
     with sglypa_reply_lock:
         if (
             current_time - last_sglypa_reply_at
-            < SGLYPA_REPLY_COOLDOWN
+            < learning_settings.sglypa_reply_cooldown
         ):
             return False
 
@@ -1299,11 +1311,11 @@ def generate_command(message, event):
     provider, separator, remaining = arguments.partition(" ")
     provider = provider.casefold()
     with learning_service.response_planning():
-        if provider in {"markov", "марков"}:
-            generated, source_usage = learning_service.generate_local(
+        if provider in {"local", "локально"}:
+            generated, source_usage = learning_service.generate_free_response(
                 event.chat_id, remaining, return_sources=True
             )
-            producer = Producer.MARKOV
+            producer = Producer.LOCAL
         elif provider in {"ai", "openai", "ии"}:
             generated = learning_service.generate_llm(
                 event.chat_id, remaining, "reply"
@@ -1539,6 +1551,11 @@ def handle_message(message, event):
     # These are control phrases, not dialogue: never learn them, answer them or
     # pass them to an external model.
     if FOREIGN_BOT_COMMAND_RE.search(text):
+        return
+
+    # Do not learn from or react to URLs, including deliberately space-separated
+    # ones such as "https www instagram com reel ...".
+    if contains_link(text):
         return
 
     meme_match = CHAIR_MEME_COMMAND_RE.fullmatch(text)

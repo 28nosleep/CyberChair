@@ -13,10 +13,10 @@ from datetime import datetime, timedelta, timezone
 from .chat_state import ChatStateAnalyzer
 from .conversation_policy import ConversationPolicy
 from .direct_address import DirectAddressRouter
+from .date_time_utility import DateTimeUtility
 from .local_responder import LocalResponder
 from .cost_diagnostics import TICKS_PER_USD
 from .autonomous_policy import AutonomousPolicy
-from .generator import LocalGenerator
 from .media_catalog import MediaCatalog
 from .media_service import MediaService
 from .memory_service import MemoryService
@@ -98,6 +98,7 @@ class LearningService:
         openai_client=None,
         rng=None,
         clock=None,
+        datetime_clock=None,
         llm_provider=None,
         xai_client=None,
         concurrency_controller=None,
@@ -105,12 +106,12 @@ class LearningService:
         self.settings = settings
         self._lock = threading.RLock()
         self._clock = clock or time.monotonic
+        self._datetime_clock = datetime_clock
         self.concurrency = concurrency_controller or process_concurrency_controller(
             settings, runtime_concurrency
         )
         self.rng = rng or random
         self.triggers = TriggerEngine(settings, self.rng, clock)
-        self.local = LocalGenerator(settings, self.rng)
         # Explicit provider/client injection remains a test/integration seam.
         # Runtime construction (no injected clients) always follows config and
         # per-chat selection.
@@ -130,6 +131,7 @@ class LearningService:
                 provider._usage_recorder = self._record_llm_usage
         self.memory = MemoryService(
             settings, self.llm_provider, self._speaker_name,
+            clock=datetime_clock,
             provider_resolver=self.provider_for_chat,
             concurrency_controller=self.concurrency,
         )
@@ -148,6 +150,9 @@ class LearningService:
         self.quality_guard = ResponseQualityGuard(self.lexical_diversity)
         self.persona = PersonaBuilder(settings, self.meme_lexicon)
         self.direct_router = DirectAddressRouter()
+        self.date_time_utility = DateTimeUtility(
+            settings.timezone_name, clock=datetime_clock
+        )
         self.local_responder = LocalResponder(
             self.meme_lexicon, self.rng, self.lexical_diversity
         )
@@ -162,7 +167,6 @@ class LearningService:
             repository=self.repository,
             active_context_snapshot=self._active_context_snapshot,
             memory=self.memory,
-            local=self.local,
             quality_guard=self.quality_guard,
             lexical_diversity=self.lexical_diversity,
             persona=self.persona,
@@ -221,7 +225,6 @@ class LearningService:
             troll_mode=self.troll_mode,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
-            generate_local=self.generate_local,
             command_meme_sources=self._command_meme_sources,
             lock=self._lock,
             photo_meme_caption_re=PHOTO_MEME_CAPTION_RE,
@@ -254,13 +257,11 @@ class LearningService:
             provider_for_chat=self.provider_for_chat,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
-            generate_local=self.generate_local,
             llm_allowed=self.llm_allowed,
             troll_mode=self.troll_mode,
             media_enabled=self.media_enabled,
             budget_exceeded=self._budget_exceeded,
             chair_meta_on_cooldown=self._chair_call_meta_joke_on_cooldown,
-            markov_ready=self._markov_ready,
             message_context=self._message_context,
             response_planning=self.response_planning,
             planning_requested=self._planning_requested,
@@ -272,6 +273,7 @@ class LearningService:
             conversation_policy=self.conversation_policy,
             direct_router=self.direct_router,
             local_responder=self.local_responder,
+            date_time_utility=self.date_time_utility,
             media=self.media,
             memory=self.memory,
             persona=self.persona,
@@ -624,9 +626,6 @@ class LearningService:
     def status(self, chat_id):
         return self.memory_facade.status(chat_id)
 
-    def _markov_ready(self, chat_id):
-        return self.generation._markov_ready(chat_id)
-
     def _chair_call_meta_joke_on_cooldown(self, chat_id, text):
         return self.generation._chair_call_meta_joke_on_cooldown(chat_id, text)
 
@@ -658,7 +657,7 @@ class LearningService:
         llm_routes = events.get("route_llm", 0) + events.get("route_grok", 0)
         answered = llm_routes + sum(
             events.get(f"route_{name}", 0)
-            for name in ("local", "markov", "gif", "meme", "sticker")
+            for name in ("local", "gif", "meme", "sticker")
         )
         llm = self.llm_cost_diagnostics(chat_id, hours)["total"]
         return {
@@ -668,7 +667,7 @@ class LearningService:
             "routes": {
                 **{
                     name: events.get(f"route_{name}", 0)
-                    for name in ("local", "markov", "gif", "meme", "sticker")
+                    for name in ("local", "gif", "meme", "sticker")
                 },
                 "llm": llm_routes,
             },
@@ -684,10 +683,18 @@ class LearningService:
     def quality_diagnostics(self, chat_id, hours=24, current=None):
         return self.generation.quality_diagnostics(chat_id, hours, current)
 
-    def generate_local(
+    def generate_free_response(
         self, chat_id, input_text=None, decorate=True, return_sources=False
     ):
-        return self.generation.generate_local(chat_id, input_text, decorate, return_sources)
+        snapshot = self._active_context_snapshot(chat_id)
+        repository = self.repository(chat_id)
+        result, _ = self.local_responder.respond(
+            chat_id, input_text or "", "social", repository,
+            recent_generated=(snapshot.recent_generated_texts if snapshot else None),
+            stable_memories=(snapshot.stable_memories if snapshot else repository.stable_memories(20)),
+            recent_dialogue=(snapshot.recent_dialogue if snapshot else repository.recent_messages(40)),
+        )
+        return (result, ()) if return_sources else result
 
     def llm_allowed(self, chat_id):
         return self.generation.llm_allowed(chat_id)
@@ -832,13 +839,11 @@ class LearningService:
             provider_for_chat=self.provider_for_chat,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
-            generate_local=self.generate_local,
             llm_allowed=self.llm_allowed,
             troll_mode=self.troll_mode,
             media_enabled=self.media_enabled,
             _budget_exceeded=self._budget_exceeded,
             _chair_call_meta_joke_on_cooldown=self._chair_call_meta_joke_on_cooldown,
-            _markov_ready=self._markov_ready,
             _message_context=self._message_context,
             response_planning=self.response_planning,
             _planning_requested=self._planning_requested,
@@ -850,6 +855,7 @@ class LearningService:
             conversation_policy=self.conversation_policy,
             direct_router=self.direct_router,
             local_responder=self.local_responder,
+            date_time_utility=self.date_time_utility,
             media=self.media,
             memory=self.memory,
             persona=self.persona,
@@ -1109,7 +1115,6 @@ class LearningService:
             troll_mode=self.troll_mode,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
-            generate_local=self.generate_local,
             meme_cooldown=self.meme_command_on_cooldown,
             local_caption=self.media_coordinator._local_command_caption,
         )

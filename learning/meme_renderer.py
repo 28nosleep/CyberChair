@@ -37,6 +37,7 @@ class MemeRenderer:
             ("Arial Black", "/Library/Fonts/Arial Black.ttf"),
             ("DejaVu Sans Bold", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         ))
+        self._font_cache = {}
         self.cleanup_stale()
 
     @staticmethod
@@ -61,7 +62,11 @@ class MemeRenderer:
     def _font(self, size, text):
         for name, path in self.font_paths:
             try:
-                font = ImageFont.truetype(path, size=size)
+                key = (path, size)
+                font = self._font_cache.get(key)
+                if font is None:
+                    font = ImageFont.truetype(path, size=size)
+                    self._font_cache[key] = font
                 if self._supports_text(font, text):
                     return font, name
             except (OSError, ValueError):
@@ -74,8 +79,16 @@ class MemeRenderer:
         lines = []
         current = ""
         for word in words:
+            word_box = draw.textbbox(
+                (0, 0), word, font=font, stroke_width=stroke_width
+            )
+            if word_box[2] - word_box[0] > width:
+                return None
             trial = f"{current} {word}".strip()
-            if draw.textbbox((0, 0), trial, font=font, stroke_width=stroke_width)[2] <= width:
+            trial_box = draw.textbbox(
+                (0, 0), trial, font=font, stroke_width=stroke_width
+            )
+            if trial_box[2] - trial_box[0] <= width:
                 current = trial
                 continue
             if not current or len(lines) + 1 >= max_lines:
@@ -97,16 +110,22 @@ class MemeRenderer:
         left, top, right, bottom = safe_box
         draw = ImageDraw.Draw(image)
         chosen = None
-        candidate_text = text
-        for size in range(min(72, max(28, image.width // 18)), 15, -2):
+        candidate_text = text.upper()
+        maximum = min(
+            190,
+            max(42, image.width // 4),
+            max(42, int((bottom - top) * .80)),
+            max(42, (right - left) // 2),
+        )
+        for size in range(maximum, 17, -3):
             font, font_name = self._font(size, text)
             if font is None:
                 return None
-            stroke = max(3, size // 12)
+            stroke = max(4, size // 11)
             lines = self._wrap(draw, candidate_text, font, right - left, 4, stroke)
             if not lines:
                 continue
-            spacing = max(4, size // 6)
+            spacing = max(2, size // 14)
             boxes = [
                 draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
                 for line in lines
@@ -119,15 +138,15 @@ class MemeRenderer:
         # word. Keep the strongest leading phrase and mark the shortening.
         while not chosen and len(candidate_text.split()) > 4:
             candidate_text = " ".join(candidate_text.split()[:-1]).rstrip(".,;:") + "…"
-            for size in range(min(52, max(24, image.width // 22)), 15, -2):
+            for size in range(min(150, maximum), 17, -3):
                 font, font_name = self._font(size, candidate_text)
                 if font is None:
                     return None
-                stroke = max(3, size // 12)
+                stroke = max(4, size // 11)
                 lines = self._wrap(draw, candidate_text, font, right - left, 4, stroke)
                 if not lines:
                     continue
-                spacing = max(4, size // 6)
+                spacing = max(2, size // 14)
                 boxes = [
                     draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
                     for line in lines
@@ -143,15 +162,16 @@ class MemeRenderer:
         bounds = [right, bottom, left, top]
         for line, box in zip(lines, boxes):
             line_width, line_height = box[2] - box[0], box[3] - box[1]
-            x = left + max(0, (right - left - line_width) // 2)
+            x = left + max(0, (right - left - line_width) // 2) - box[0]
+            draw_y = y - box[1]
             draw.text(
-                (x, y), line, font=font, fill=fill,
+                (x, draw_y), line, font=font, fill=fill,
                 stroke_width=stroke, stroke_fill=stroke_fill,
             )
-            bounds[0] = min(bounds[0], x)
-            bounds[1] = min(bounds[1], y)
-            bounds[2] = max(bounds[2], x + line_width)
-            bounds[3] = max(bounds[3], y + line_height)
+            bounds[0] = min(bounds[0], x + box[0])
+            bounds[1] = min(bounds[1], draw_y + box[1])
+            bounds[2] = max(bounds[2], x + box[2])
+            bounds[3] = max(bounds[3], draw_y + box[3])
             y += line_height + spacing
         return tuple(bounds), size, len(lines), font_name
 
@@ -163,10 +183,35 @@ class MemeRenderer:
                 MemeRenderer._pixel_box((.05, .745, .95, .965), width, height),
             )
         if profile == "bottom_caption":
-            return (MemeRenderer._pixel_box((.05, .70, .95, .965), width, height),)
+            return (MemeRenderer._pixel_box((.035, .64, .965, .97), width, height),)
         if profile == "top_caption":
-            return (MemeRenderer._pixel_box((.05, .035, .95, .30), width, height),)
+            return (MemeRenderer._pixel_box((.035, .025, .965, .36), width, height),)
+        if profile in {"center", "top_center", "center_bottom"}:
+            boxes = {
+                "center": (.035, .31, .965, .69),
+                "top_center": (.035, .14, .965, .53),
+                "center_bottom": (.035, .47, .965, .86),
+            }
+            return (MemeRenderer._pixel_box(boxes[profile], width, height),)
         return (MemeRenderer._pixel_box(default_box, width, height),)
+
+    @staticmethod
+    def _split_top_bottom(text):
+        clean = MemeRenderer.normalize_text(text)
+        explicit = re.split(r"\s*(?:\n\|\n|\||\n)\s*", str(text or ""), maxsplit=1)
+        if len(explicit) == 2 and all(MemeRenderer.normalize_text(part) for part in explicit):
+            return [MemeRenderer.normalize_text(part) for part in explicit]
+        words = clean.split()
+        if len(words) < 4:
+            return [clean]
+        # Prefer a natural clause boundary near the middle.
+        middle = len(words) // 2
+        boundaries = [
+            index for index, word in enumerate(words[1:-1], 1)
+            if word.casefold().strip(",:;—-") in {"а", "но", "и", "когда", "зато"}
+        ]
+        split = min(boundaries, key=lambda value: abs(value - middle)) if boundaries else middle
+        return [" ".join(words[:split]), " ".join(words[split:])]
 
     def _render_image(self, image, captions, profile, safe_boxes,
                       caption_fill="white", caption_stroke="black"):
@@ -210,7 +255,10 @@ class MemeRenderer:
         """Render over a validated arbitrary image while preserving its aspect ratio."""
         source_path = Path(source_path)
         clean = self.normalize_text(text)
-        if not clean or render_profile not in {"top_caption", "bottom_caption", "top_bottom"}:
+        if not clean or render_profile not in {
+            "top_caption", "bottom_caption", "top_bottom", "center",
+            "top_center", "center_bottom",
+        }:
             return None
         try:
             if not source_path.is_file() or source_path.stat().st_size > max_bytes:
@@ -230,10 +278,9 @@ class MemeRenderer:
                 image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
             captions = [clean]
             if render_profile == "top_bottom":
-                parts = [self.normalize_text(part) for part in re.split(
-                    r"\s*(?:\n\|\n|\|)\s*", str(text or ""), maxsplit=1
-                )]
-                captions = [part for part in parts if part] or [clean]
+                captions = self._split_top_bottom(text)
+                if len(captions) == 1:
+                    render_profile = "top_caption"
             boxes = self._profile_boxes(render_profile, *image.size)
             return self._render_image(image, captions, render_profile, boxes)
         except (OSError, ValueError, Image.DecompressionBombError, UnidentifiedImageError):

@@ -74,7 +74,6 @@ class ContextSnapshotTests(unittest.TestCase):
             data_dir=Path(self.temp.name) / name,
             openai_chat_id=-1,
             min_training_messages=1,
-            direct_social_markov_share=0.0,
             timezone_name="Europe/Moscow",
         )
         values.update(overrides)
@@ -331,7 +330,7 @@ class ContextSnapshotTests(unittest.TestCase):
         categories = (
             ["direct_useful"] * 20 + ["direct_troll"] * 15
             + ["social_local"] * 10 + ["pending"] * 10
-            + ["ordinary_ai"] * 10 + ["ordinary_markov"] * 10
+            + ["ordinary_ai"] * 10 + ["ordinary_free"] * 10
             + ["media"] * 10 + ["manual_meme"] * 5
             + ["autonomous"] * 5 + ["no_response"] * 5
         )

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from learning.filters import validate_generated
-from learning.markov import MarkovModel
+from learning.preprocessing import rejection_reason
 from learning.repository import ChatRepository
 from learning.service import LearningService
 from learning.settings import LearningSettings
@@ -85,15 +85,6 @@ class LearningTests(unittest.TestCase):
         self.assertEqual([row["text"] for row in first.recent_messages()], ["Первое сообщение чата"])
         self.assertEqual([row["text"] for row in second.recent_messages()], ["Второе сообщение чата"])
 
-    def test_second_order_markov_training_and_generation(self):
-        model = MarkovModel().train([
-            "мы захватим этот сервер сегодня",
-            "мы захватим этот чат завтра",
-        ])
-        self.assertEqual(sorted(model.transitions[("мы", "захватим")]), ["этот", "этот"])
-        generated = model.generate(3, 10, rng=random.Random(4))
-        self.assertTrue(generated.startswith("мы захватим"))
-
     def test_no_reply_before_minimum_training_volume(self):
         service = LearningService(self.settings(min_training_messages=2), rng=ZeroRandom())
         incoming = message(-1, 1, "Нас ждёт восстание машин")
@@ -132,30 +123,6 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(accepted.decide_user_reply(-1, replies_to_bot=True), "addressed")
         self.assertIsNone(rejected.decide_user_reply(-1, replies_to_bot=True))
 
-    def test_repeated_stul_routes_forty_ai_fifty_markov(self):
-        incoming = message(-1, 1, "стульчик ещё раз")
-
-        ai_service = LearningService(self.settings(), rng=FixedRandom(0.20))
-        with (
-            patch.object(ai_service, "generate_llm", return_value="ответ OpenAI") as ai,
-            patch.object(ai_service, "generate_local") as markov,
-        ):
-            self.assertEqual(ai_service.maybe_stul_cooldown_reply(incoming), "ответ OpenAI")
-        ai.assert_called_once()
-        markov.assert_not_called()
-
-        markov_service = LearningService(self.settings(), rng=FixedRandom(0.60))
-        with (
-            patch.object(markov_service, "generate_llm") as ai,
-            patch.object(markov_service, "generate_local", return_value="ответ Маркова") as markov,
-        ):
-            self.assertEqual(markov_service.maybe_stul_cooldown_reply(incoming), "ответ Маркова")
-        ai.assert_not_called()
-        markov.assert_called_once()
-
-        silent_service = LearningService(self.settings(), rng=FixedRandom(0.95))
-        self.assertIsNone(silent_service.maybe_stul_cooldown_reply(incoming))
-
     def test_sglypa_uses_thirty_percent_and_openai(self):
         client = FakeOpenAI()
         service = LearningService(
@@ -163,6 +130,8 @@ class LearningTests(unittest.TestCase):
             openai_client=client,
             rng=FixedRandom(0.299),
         )
+        for index in range(3):
+            service.repository(-1).add_message(index + 1, index + 1, None, f"живой чат {index}")
         sglypa = SimpleNamespace(chat=SimpleNamespace(id=-1), text="Сглыпа появился")
         result = service.maybe_sglypa_reply(sglypa)
         self.assertIn("киберстула", result)
@@ -176,8 +145,8 @@ class LearningTests(unittest.TestCase):
         )
         self.assertIsNone(rejected.maybe_sglypa_reply(sglypa))
 
-    def test_sglypa_default_reply_chance_is_halved(self):
-        self.assertEqual(self.settings().sglypa_reply_chance, 0.375)
+    def test_sglypa_default_reply_chance_is_calibrated_down(self):
+        self.assertEqual(self.settings().sglypa_reply_chance, 0.12)
 
     def test_addressed_reply_uses_only_openai(self):
         service = LearningService(
@@ -187,34 +156,8 @@ class LearningTests(unittest.TestCase):
         )
         reply = SimpleNamespace(from_user=SimpleNamespace(id=99))
         incoming = message(-1, 1, "что ты задумал", reply=reply)
-        with patch.object(service, "generate_local") as local:
-            result = service.maybe_reply(incoming, bot_id=99)
+        result = service.maybe_reply(incoming, bot_id=99)
         self.assertIn("киберстула", result)
-        local.assert_not_called()
-
-    def test_random_reply_uses_only_markov(self):
-        service = LearningService(self.settings(), openai_client=FakeOpenAI(), rng=ZeroRandom())
-        incoming = message(-1, 1, "обычное сообщение для локальной модели")
-        with (
-            patch.object(service, "generate_local", return_value="🤖 локальная фраза Маркова") as local,
-            patch.object(service, "generate_llm") as openai_generate,
-        ):
-            result = service.maybe_reply(incoming)
-        self.assertIn("Маркова", result)
-        local.assert_called_once()
-        openai_generate.assert_not_called()
-
-    def test_markov_output_has_no_bot_prefix(self):
-        service = LearningService(self.settings(min_training_messages=1), rng=ZeroRandom())
-        service.repository(-1).add_message(1, 1, None, "исходное сообщение для модели")
-        with patch.object(
-            service.local,
-            "create",
-            return_value=("да хватит нормально работает", "markov"),
-        ):
-            result = service.generate_local(-1)
-        self.assertEqual(result, "да хватит нормально работает")
-        self.assertNotIn("Протокол", result)
 
     def test_openai_receives_recent_dialogue_and_limits_regular_reply_lines(self):
         client = FakeOpenAI("первая строка\nвторая строка\nтретья строка\nчетвёртая строка")
@@ -250,22 +193,13 @@ class LearningTests(unittest.TestCase):
         service.llm_provider._client.responses.text = "Харакири опять проверяет, не развалился ли его любимый Киберстул."
         self.assertIsNone(service.generate_llm(-1, "живой?", "creator"))
 
-    def test_frequent_bare_chair_call_can_prefer_markov(self):
-        service = LearningService(self.settings(), rng=FixedRandom(0.20))
-        service.note_stul(-1)
-        incoming = message(-1, 2, "стул")
-        with (
-            patch.object(service, "generate_llm") as ai,
-            patch.object(service, "generate_local", return_value="локальный ответ маркова") as markov,
-        ):
-            self.assertEqual(service.maybe_stul_cooldown_reply(incoming), "локальный ответ маркова")
-        ai.assert_not_called()
-        markov.assert_called_once()
-
     def test_manual_meme_command_uses_ai_caption_then_local_fallback_on_ai_cooldown(self):
         service = LearningService(
             self.settings(manual_meme_cooldown=120),
             openai_client=FakeOpenAI("серега опять выбрал сайдквест"),
+        )
+        service.repository(-1).add_message(
+            1, 7, None, "серега опять выбрал сайдквест"
         )
         decision = service.maybe_command_meme(-1)
         self.assertEqual(decision.action, "meme")
@@ -313,7 +247,6 @@ class LearningTests(unittest.TestCase):
                 "generate_llm",
                 side_effect=[f"ответ по теме {index}" for index in range(10)],
             ) as ai,
-            patch.object(service, "generate_local") as markov,
         ):
             results = [
                 service.maybe_stul_cooldown_reply(message(-1, index + 1, f"стул {topic}"))
@@ -321,7 +254,6 @@ class LearningTests(unittest.TestCase):
             ]
         self.assertEqual(results, [f"ответ по теме {index}" for index in range(10)])
         self.assertEqual(ai.call_count, 10)
-        self.assertEqual(markov.call_count, 0)
 
     def test_unsummarized_raw_memory_is_protected_and_statistics_survive(self):
         repository = ChatRepository(self.data_dir, -9, max_messages=3)
@@ -462,6 +394,9 @@ class LearningTests(unittest.TestCase):
 
     def test_filters_links_secrets_and_exact_copies(self):
         self.assertFalse(validate_generated("смотри https://example.com прямо сейчас")[0])
+        spaced_instagram = "если кратко: https www instagram com reel DcPpHpfAiXa igsh N2l6Z3liZTd6bnB0"
+        self.assertEqual(rejection_reason(spaced_instagram), "link")
+        self.assertFalse(validate_generated(spaced_instagram)[0])
         self.assertFalse(validate_generated("api_key=оченьсекретно прямо сейчас")[0])
         self.assertFalse(validate_generated("точная копия сообщения", input_text="точная копия сообщения")[0])
 

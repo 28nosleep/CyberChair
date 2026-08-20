@@ -152,7 +152,7 @@ class LexicalDiversityTests(unittest.TestCase):
         self.tracker = LexicalDiversityTracker(window=40)
 
     def test_single_use_allowed_repetition_strong_and_window_recovers(self):
-        self.assertEqual(self.tracker.score("классика жанра", ["ну классика"])[0], 0)
+        self.assertGreater(self.tracker.score("классика жанра", ["ну классика"])[0], 5)
         recent = ["классика приехала", "ну классика", "классика жанра"]
         self.assertGreater(self.tracker.score("классика снова", recent)[0], 3)
         aged = recent + [f"обычная содержательная реплика номер {i}" for i in range(45)]

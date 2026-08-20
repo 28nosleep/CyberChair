@@ -53,7 +53,7 @@ class PendingConversationTests(unittest.TestCase):
     def service(self, responses=None, **overrides):
         values = dict(
             data_dir=Path(self.temp.name), openai_chat_id=-1,
-            min_training_messages=20, direct_social_markov_share=0.0,
+            min_training_messages=20,
             pending_conversation_ttl_seconds=1200,
         )
         values.update(overrides)

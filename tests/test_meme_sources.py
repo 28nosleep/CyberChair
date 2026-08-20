@@ -41,12 +41,6 @@ class MemeSourceSelectorTests(unittest.TestCase):
         next_source = self.selector.choose(-1, self.rows, fallback=True)
         self.assertNotEqual(next_source.message_id, source.message_id)
 
-    def test_markov_cannot_loop(self):
-        self.assertTrue(self.selector.markov_allowed(-1))
-        self.selector.record(-1, MemeSource("markov", "абсурд"))
-        self.assertFalse(self.selector.markov_allowed(-1))
-
-
 class LocalMemeFallbackTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -61,19 +55,14 @@ class LocalMemeFallbackTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_local_fallback_prefers_old_real_quote_before_markov(self):
-        with patch.object(self.service, "meme_command_on_cooldown", return_value=True), patch.object(
-            self.service, "generate_local"
-        ) as markov:
+    def test_local_fallback_prefers_old_real_quote(self):
+        with patch.object(self.service, "meme_command_on_cooldown", return_value=True):
             decision = self.service.maybe_command_meme(-1)
         self.assertEqual(decision.action, "meme")
         self.assertIn("manual_local_old", decision.reason)
-        markov.assert_not_called()
 
-    def test_no_canned_phrase_exists_after_markov(self):
-        with patch.object(self.service.meme_sources, "choose", return_value=MemeSource("none", "")), patch.object(
-            self.service, "generate_local", return_value=None
-        ):
+    def test_no_canned_phrase_exists_after_real_quotes(self):
+        with patch.object(self.service.meme_sources, "choose", return_value=MemeSource("none", "")):
             source, caption = self.service.media_coordinator._local_command_caption(
                 -1, MemeSource("none", ""), [], []
             )

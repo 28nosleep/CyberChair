@@ -60,7 +60,7 @@ class DirectAddressRoutingTests(unittest.TestCase):
     def service(self, provider=None, rng=None, **overrides):
         values = dict(
             data_dir=Path(self.temp.name), openai_chat_id=-1,
-            min_training_messages=20, direct_social_markov_share=0.0,
+            min_training_messages=20,
         )
         values.update(overrides)
         provider = provider or CountingProvider()
@@ -221,18 +221,12 @@ class DirectAddressRoutingTests(unittest.TestCase):
         self.assertIs(result, gif)
         self.assertEqual(provider.calls, [])
 
-    def test_markov_and_grok_are_mutually_exclusive(self):
-        service, provider = self.service(
-            rng=FixedRandom(0.0), min_training_messages=1,
-            direct_social_markov_share=1.0,
+    def test_free_social_and_grok_are_mutually_exclusive(self):
+        service, provider = self.service(rng=FixedRandom(0.0))
+        result = service.maybe_direct_reply(
+            message("стул чё ты несёшь"), explicit_address=True
         )
-        service.repository(-1).add_message(10, 8, None, "старая длинная реплика для обучения")
-        with patch.object(service, "generate_local", return_value="локальный марков ответ") as markov:
-            result = service.maybe_direct_reply(
-                message("стул чё ты несёшь"), explicit_address=True
-            )
-        self.assertEqual(result, "локальный марков ответ")
-        markov.assert_called_once()
+        self.assertTrue(result)
         self.assertEqual(provider.calls, [])
 
     def test_local_responder_avoids_immediate_repeats(self):

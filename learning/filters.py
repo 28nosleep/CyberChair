@@ -7,8 +7,8 @@ from .preprocessing import (
     PHONE_RE,
     SECRET_RE,
     TOKEN_RE,
-    URL_RE,
     VOICE_STORY_COMMAND_RE,
+    contains_link,
     normalize_spaces,
 )
 
@@ -47,7 +47,7 @@ def validate_generated(text, source_texts=(), input_text=None, previous_bot_text
         return False, "empty"
     if clean.startswith("/"):
         return False, "command"
-    if URL_RE.search(clean) or EMAIL_RE.search(clean) or PHONE_RE.search(clean):
+    if contains_link(clean) or EMAIL_RE.search(clean) or PHONE_RE.search(clean):
         return False, "personal_or_link"
     if TOKEN_RE.search(clean) or SECRET_RE.search(clean):
         return False, "secret"

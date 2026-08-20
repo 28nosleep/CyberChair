@@ -14,7 +14,7 @@ Telegram update
   → per-chat FIFO arbitration
   → ContextSnapshot
   → ForegroundOrchestrator
-      → GenerationCoordinator / MediaCoordinator / LocalResponder / Markov
+      → GenerationCoordinator / MediaCoordinator / LocalResponder
   → ResponsePlan
   → Telegram adapter delivery
   → DeliveryReceipt
@@ -32,7 +32,7 @@ repository connections or Telegram objects.
 |---|---|---|
 | `LearningService` | Composition root and supported facade | Domain algorithms or Telegram delivery |
 | `ForegroundOrchestrator` | Existing foreground route ordering and final-plan arbitration | Telegram parsing/delivery or persistence schema |
-| `GenerationCoordinator` | Provider-neutral LLM, LocalResponder and Markov generation/fallback | Telegram transport or routing precedence |
+| `GenerationCoordinator` | Provider-neutral LLM generation and validation | Telegram transport or routing precedence |
 | `MediaCoordinator` | Media selection, explicit meme preparation and render coordination | Telegram send or renderer implementation |
 | `AutonomousCoordinator` | Optional autonomous decision lifecycle | Foreground scheduling or memory maintenance |
 | `ResponseLifecycle` | Typed post-delivery commit/abort actions | Telegram delivery |

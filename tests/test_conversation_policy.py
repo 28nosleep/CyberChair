@@ -307,7 +307,10 @@ class ConversationPolicyTests(unittest.TestCase):
         with (
             patch.object(service, "_policy_quiet_hours", return_value=False),
             patch.object(service.triggers, "decide_user_reply") as old_decision,
-            patch.object(service, "generate_local", return_value="локальный ответ"),
+            patch.object(
+                service.local_responder, "respond",
+                return_value=("локальный ответ", ()),
+            ),
         ):
             self.assertEqual(
                 service.maybe_reply(incoming(1, "обычное входящее сообщение")),

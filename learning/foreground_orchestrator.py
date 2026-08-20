@@ -34,13 +34,13 @@ class ForegroundOrchestrator:
         self, *, settings, repository, normalize_event, active_snapshot,
         as_utc, enabled, context_snapshot, media_context_snapshot,
         create_response_plan, pending_create_action, delivery_type_for_media,
-        provider_for_chat, provider_available, generate_llm, generate_local,
+        provider_for_chat, provider_available, generate_llm,
         llm_allowed, troll_mode, media_enabled,
         budget_exceeded, chair_meta_on_cooldown,
-        markov_ready, message_context, response_planning, planning_requested,
+        message_context, response_planning, planning_requested,
         deterministic_media_roll, policy_quiet_hours,
         response_activity, ensure_action_visible, chat_state_analyzer,
-        conversation_policy, direct_router, local_responder,
+        conversation_policy, direct_router, local_responder, date_time_utility,
         media, memory, persona, meme_lexicon, triggers,
         rng, lock, clock,
     ):
@@ -58,13 +58,11 @@ class ForegroundOrchestrator:
         self.provider_for_chat = provider_for_chat
         self.provider_available = provider_available
         self.generate_llm = generate_llm
-        self.generate_local = generate_local
         self.llm_allowed = llm_allowed
         self.troll_mode = troll_mode
         self.media_enabled = media_enabled
         self._budget_exceeded = budget_exceeded
         self._chair_call_meta_joke_on_cooldown = chair_meta_on_cooldown
-        self._markov_ready = markov_ready
         self._message_context = message_context
         self.response_planning = response_planning
         self._planning_requested = planning_requested
@@ -76,6 +74,7 @@ class ForegroundOrchestrator:
         self.conversation_policy = conversation_policy
         self.direct_router = direct_router
         self.local_responder = local_responder
+        self.date_time_utility = date_time_utility
         self.media = media
         self.memory = memory
         self.persona = persona
@@ -163,9 +162,7 @@ class ForegroundOrchestrator:
             )
             response_mode = (
                 "troll_user" if behavior_mode == "troll_user"
-                else "markov" if route == "markov"
-                else "local" if route == "local"
-                else "useful"
+                else "local" if route == "local" else "useful"
             )
             actions = []
             if pending_finalize_user_id is not None:
@@ -181,7 +178,6 @@ class ForegroundOrchestrator:
                 final_producer = {
                     "llm": Producer.LLM,
                     "local": Producer.LOCAL,
-                    "markov": Producer.MARKOV,
                 }.get(route, Producer.LOCAL)
             actions.extend((
                 RoutingCommit(route, response_mode),
@@ -211,9 +207,7 @@ class ForegroundOrchestrator:
         repository.record_routing_event(f"route_{route}")
         response_mode = (
             "troll_user" if behavior_mode == "troll_user"
-            else "markov" if route == "markov"
-            else "local" if route == "local"
-            else "useful"
+            else "local" if route == "local" else "useful"
         )
         repository.record_routing_event(f"response_mode_{response_mode}")
         repository.record_generated(
@@ -447,6 +441,17 @@ class ForegroundOrchestrator:
                 rf"@{re.escape(bot_username)}\b", "", subject, flags=re.I
             ).strip()
 
+        factual_answer = self.date_time_utility.answer(subject)
+        if factual_answer:
+            repository.record_routing_event("intent_date_time")
+            with self._response_activity(chat_id, "typing", "local") as action:
+                self._ensure_action_visible(action, "local", factual_answer)
+            return self._record_direct_result(
+                chat_id, event, "local", factual_answer, "date_time",
+                as_plan=_as_plan,
+                pending_finalize_user_id=(user_id if _as_plan else None),
+            )
+
         state = self.chat_state_analyzer.analyze(
             repository,
             incoming_message=event,
@@ -534,15 +539,7 @@ class ForegroundOrchestrator:
                     pending_finalize_user_id=(user_id if _as_plan else None),
                 )
 
-        markov_selected = (
-            route.producer != "llm"
-            and route.intent == SOCIAL
-            and self._markov_ready(chat_id)
-            and self.rng.random() < max(0.0, min(1.0, self.settings.direct_social_markov_share))
-        )
-        selected_producer = "llm" if route.producer == "llm" else (
-            "markov" if markov_selected else "local"
-        )
+        selected_producer = "llm" if route.producer == "llm" else "local"
         with self._response_activity(chat_id, "typing", selected_producer) as action:
             if route.producer == "llm":
                 result = self.generate_llm(
@@ -558,23 +555,6 @@ class ForegroundOrchestrator:
                     )
                 repository.record_routing_event("llm_fallback_local")
 
-            # Markov is an occasional SOCIAL producer and is selected before
-            # generation, never next to a successful AI/media response.
-            if markov_selected:
-                generated = self.generate_local(
-                    chat_id, subject, return_sources=_as_plan
-                )
-                result, source_usage = (
-                    generated if _as_plan else (generated, ())
-                )
-                if result and not self._chair_call_meta_joke_on_cooldown(chat_id, result):
-                    self._ensure_action_visible(action, "markov", result)
-                    return self._record_direct_result(
-                        chat_id, event, "markov", result, as_plan=_as_plan,
-                        pending_finalize_user_id=(user_id if _as_plan else None),
-                        source_usage=source_usage,
-                    )
-
             result, memes = self.local_responder.respond(
                 chat_id, subject, route.intent, repository,
                 self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
@@ -585,7 +565,12 @@ class ForegroundOrchestrator:
                     snapshot.recent_generated_texts[-40:]
                     if snapshot is not None else None
                 ),
-                snapshot.stable_memories if snapshot is not None else None,
+                snapshot.stable_memories if snapshot is not None
+                else repository.stable_memories(20),
+                snapshot.recent_dialogue if snapshot is not None
+                else repository.recent_messages(40),
+                user_id=event.user_id,
+                username=event.username,
             )
             persona_usage = None
             if memes:
@@ -760,9 +745,9 @@ class ForegroundOrchestrator:
                 chat_id, media_decision.action, media_decision.reason,
             )
             return media_decision
-        # Addressed replies use the selected provider. Ordinary random replies
-        # may still use the existing local generator.
-        provider = "llm" if kind in {"addressed", "openai_random"} else "markov"
+        # Addressed replies use the selected provider. Ordinary free replies
+        # use the same contextual responder as direct fallback.
+        provider = "llm" if kind in {"addressed", "openai_random"} else "local"
         source_usage = ()
         with self._response_activity(chat_id, "typing", provider) as action:
             if provider == "llm":
@@ -775,18 +760,22 @@ class ForegroundOrchestrator:
                     chat_state=state,
                 )
             else:
-                generated = self.generate_local(
-                    chat_id, text, return_sources=_as_plan
-                )
-                result, source_usage = (
-                    generated if _as_plan else (generated, ())
+                result, _ = self.local_responder.respond(
+                    chat_id, text, SOCIAL, repository,
+                    self.persona._recent_ids[chat_id],
+                    self.persona._recent_groups[chat_id],
+                    self.troll_mode(chat_id), decision.troll_intensity,
+                    recent_generated=(snapshot.recent_generated_texts if snapshot else None),
+                    stable_memories=(snapshot.stable_memories if snapshot else repository.stable_memories(20)),
+                    recent_dialogue=(snapshot.recent_dialogue if snapshot else repository.recent_messages(40)),
+                    user_id=event.user_id, username=event.username,
                 )
             if result:
                 self._ensure_action_visible(action, provider, result)
         if result:
             if _as_plan:
                 final_producer = (
-                    Producer.LLM if provider == "llm" else Producer.MARKOV
+                    Producer.LLM if provider == "llm" else Producer.LOCAL
                 )
                 actions = [
                     TriggerCommit(kind),
@@ -861,8 +850,7 @@ class ForegroundOrchestrator:
 
         # “стул” is an address, never the subject by itself.  A call that also
         # contains a real topic must reach the contextual model even if it has
-        # no question mark; otherwise rapid calls degrade into Markov jokes
-        # about the invocation rather than answering the chat.
+        # no question mark; otherwise rapid calls degrade into unrelated jokes.
         subject = self.persona._strip_chair_invocation(event.effective_text)
         subject_words = {
             word for word in significant_words(subject)
@@ -888,27 +876,23 @@ class ForegroundOrchestrator:
         frequency = self.triggers.note_chair(chat_id)
         roll = self.rng.random()
         ai_chance = self.settings.reply_to_stul_chance
-        markov_chance = self.settings.stul_markov_reply_chance
+        local_chance = .50
         invocation = normalize_spaces(event.effective_text).casefold().strip(".,!?…")
         is_bare_invocation = invocation in {"стул", "стульчик"}
         factor = self.settings.bare_stul_reply_factor if is_bare_invocation else 1.0
-        total = min(1.0, (ai_chance + markov_chance) * factor)
+        total = min(1.0, (ai_chance + local_chance) * factor)
         if roll >= total:
             return None
 
         provider_roll = roll / total if total else 1.0
         if frequency >= 2:
-            provider = (
-                "markov"
-                if provider_roll < self.settings.frequent_stul_markov_chance
-                else "ai"
-            )
+            provider = "local" if provider_roll < .80 else "ai"
         elif is_bare_invocation:
             # When a rare bare call is accepted, prefer the coherent path; the
             # occurrence probability itself is already sharply reduced.
-            provider = "ai" if provider_roll < .8 else "markov"
+            provider = "ai" if provider_roll < .8 else "local"
         else:
-            provider = "ai" if provider_roll < ai_chance / (ai_chance + markov_chance) else "markov"
+            provider = "ai" if provider_roll < ai_chance / (ai_chance + local_chance) else "local"
 
         if provider == "ai":
             result = self.generate_llm(
@@ -918,8 +902,14 @@ class ForegroundOrchestrator:
             )
             provider = "ai"
         else:
-            result = self.generate_local(chat_id, event.effective_text)
-            provider = "markov"
+            result, _ = self.local_responder.respond(
+                chat_id, event.effective_text, SOCIAL, self.repository(chat_id),
+                self.persona._recent_ids[chat_id], self.persona._recent_groups[chat_id],
+                self.troll_mode(chat_id), recent_generated=None,
+                stable_memories=None, recent_dialogue=None,
+                user_id=event.user_id, username=event.username,
+            )
+            provider = "local"
 
         if result:
             if self._chair_call_meta_joke_on_cooldown(chat_id, result):
@@ -967,9 +957,28 @@ class ForegroundOrchestrator:
         chat_id = event.chat_id
         if not self.troll_mode(chat_id):
             return None
-        if self.rng.random() >= self.settings.sglypa_reply_chance:
-            return None
         if not self.triggers.allowed(chat_id, "sglypa", addressed=True):
+            return None
+        repository = self.repository(chat_id)
+        now = datetime.now(timezone.utc)
+        cooldown_since = (
+            now - timedelta(seconds=self.settings.sglypa_reply_cooldown)
+        ).isoformat()
+        if repository.generated_since(cooldown_since, "sglypa"):
+            return None
+        snapshot = self._active_context_snapshot(chat_id)
+        dialogue = snapshot.recent_dialogue if snapshot is not None else repository.recent_messages(20)
+        human_activity = sum(
+            row.get("speaker") != "cyberchair" and not row.get("is_bot", False)
+            for row in dialogue[-12:]
+        )
+        chance = self.settings.sglypa_reply_chance
+        if human_activity < 3:
+            chance *= .45
+        recent_since = (now - timedelta(hours=6)).isoformat()
+        if repository.generated_since(recent_since, "sglypa"):
+            chance *= .20
+        if self.rng.random() >= chance:
             return None
         with self._response_activity(chat_id, "typing", "llm"):
             result = self.generate_llm(chat_id, event.effective_text, "sglypa")

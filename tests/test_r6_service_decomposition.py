@@ -78,7 +78,7 @@ def test_composition_root_uses_specialized_owners_and_shared_instances(tmp_path)
     assert isinstance(learning_service.response_lifecycle, ResponseLifecycle)
 
     assert learning_service.generation.persona is learning_service.persona
-    assert learning_service.generation.local is learning_service.local
+    assert learning_service.foreground.local_responder is learning_service.local_responder
     assert learning_service.generation.concurrency is learning_service.concurrency
     assert learning_service.media_coordinator.media is learning_service.media
     assert learning_service.media_coordinator.meme_sources is learning_service.meme_sources
@@ -113,8 +113,8 @@ def test_public_facade_methods_delegate_to_their_single_owner(tmp_path):
     with patch.object(learning_service.memory_facade, "ingest", return_value=(True, None)) as owner:
         assert learning_service.ingest(incoming) == (True, None)
         owner.assert_called_once()
-    with patch.object(learning_service.generation, "generate_local", return_value="local") as owner:
-        assert learning_service.generate_local(-1, "x") == "local"
+    with patch.object(learning_service.local_responder, "respond", return_value=("local", ())) as owner:
+        assert learning_service.generate_free_response(-1, "x") == "local"
         owner.assert_called_once()
     with patch.object(learning_service.media_coordinator, "ingest_gif", return_value=True) as owner:
         assert learning_service.ingest_gif(incoming) is True

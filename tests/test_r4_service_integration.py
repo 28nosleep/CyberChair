@@ -99,7 +99,6 @@ class R4ServiceIntegrationTests(unittest.TestCase):
                 generated_cooldown=0,
                 addressed_cooldown=0,
                 max_generated_per_hour=100,
-                direct_social_markov_share=0.0,
             ),
             llm_provider=provider,
             rng=FixedRandom(),

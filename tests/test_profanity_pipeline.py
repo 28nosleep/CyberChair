@@ -16,7 +16,6 @@ from learning import (
 )
 from learning.direct_address import SOCIAL
 from learning.local_responder import LocalResponder
-from learning.markov import MarkovModel
 from learning.meme_renderer import MemeRenderer
 from learning.repository import ChatRepository
 
@@ -81,7 +80,6 @@ class ProfanityPipelineTests(unittest.TestCase):
         self.settings = LearningSettings(
             data_dir=Path(self.temp.name), openai_chat_id=-1,
             addressed_cooldown=0, generated_cooldown=0,
-            direct_social_markov_share=0,
         )
 
     def tearDown(self):
@@ -140,14 +138,6 @@ class ProfanityPipelineTests(unittest.TestCase):
             "ну это пиздец блять",
         )
         self.assertIn("мат разрешён без маскировки", self.build(purpose="meme_caption").input)
-
-    def test_markov_keeps_profanity_in_training_corpus(self):
-        model = MarkovModel().train(["этот ебаный релиз опять проебал сроки"])
-        self.assertIn("релиз", model.transitions[("этот", "ебаный")])
-        self.assertIn("сроки", model.transitions[("опять", "проебал")])
-        generated = model.generate(min_words=3, max_words=12, rng=random.Random(1))
-        self.assertIn("ебаный", generated)
-        self.assertIn("проебал", generated)
 
     def test_troll_off_keeps_neutral_behavior(self):
         request = self.build(troll_mode=False)
