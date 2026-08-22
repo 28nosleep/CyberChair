@@ -346,6 +346,21 @@ class GenerationCoordinator:
         log.info("LLM_RESULT chat_id=%s provider=%s success=true accepted=false fallback_reason=validation_reject validation_reject=%s producer_after_fallback=local", chat_id, provider_name, validation_reason)
         return None
 
+    def generate_grounded(self, chat_id, request):
+        """One provider call for a caller-built bounded factual request."""
+        if not self.llm_allowed_check(chat_id):
+            return None
+        repository = self.repository(chat_id)
+        provider = self.provider_for_chat(chat_id)
+        provider_name = str(getattr(provider, "provider_key", self.llm_provider_name(chat_id))).casefold()
+        metadata = request.metadata
+        if metadata is not None:
+            metadata["event_id"] = current_event_id()
+        with llm_network_call(repository, provider_name, "greentext", self.concurrency) as allowed:
+            if not allowed:
+                return None
+            return provider.generate(request)
+
     def _as_utc(self, value):
         if not value:
             return None

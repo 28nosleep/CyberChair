@@ -24,6 +24,7 @@ from .response_plan import (
     PolicyTargetCommit, Producer, RoutingCommit, SourceUsageCommit,
     StructureUsageCommit, TriggerCommit,
 )
+from .greentext import build_request as build_greentext_request, fallback as greentext_fallback, select_episode, validate_output
 
 
 # Preserve the established diagnostic logger while moving code ownership.
@@ -38,7 +39,7 @@ class ForegroundOrchestrator:
         as_utc, enabled, context_snapshot, media_context_snapshot,
         create_response_plan, pending_create_action, delivery_type_for_media,
         prepare_reaction_response,
-        provider_for_chat, provider_available, generate_llm,
+        provider_for_chat, provider_available, generate_llm, generate_grounded_llm,
         llm_allowed, troll_mode, media_enabled,
         budget_exceeded, chair_meta_on_cooldown,
         message_context, response_planning, planning_requested,
@@ -64,6 +65,7 @@ class ForegroundOrchestrator:
         self.provider_for_chat = provider_for_chat
         self.provider_available = provider_available
         self.generate_llm = generate_llm
+        self.generate_grounded_llm = generate_grounded_llm
         self.llm_allowed = llm_allowed
         self.troll_mode = troll_mode
         self.media_enabled = media_enabled
@@ -956,6 +958,38 @@ class ForegroundOrchestrator:
                 provider,
             )
         return result
+
+    def prepare_greentext(self, message):
+        """Explicit command route: one episode, at most one LLM call, one plan."""
+        event = self._normalized_event(message)
+        snapshot = self.context_snapshot(event)
+        repository = self.repository(event.chat_id)
+        episode = select_episode(
+            snapshot.recent_dialogue, self.moment_detector,
+            snapshot.recent_generated, repository.evidence_candidates(limit=120),
+        )
+        if episode is None:
+            text = ">сейчас гринтекст лепить не из чего"
+            return self._create_response_plan(event, text, Producer.LOCAL, "greentext", required=True,
+                actions=(RoutingCommit("greentext", "local"), GeneratedCommit(text, "greentext:empty")))
+        result = None
+        if self.llm_allowed(event.chat_id) and self.provider_available(event.chat_id):
+            request = build_greentext_request(event.chat_id, episode, f"cyberchair-chat:{event.chat_id}")
+            with self._response_activity(event.chat_id, "typing", "llm") as action:
+                result = self.generate_grounded_llm(event.chat_id, request)
+                if result and validate_output(result, episode):
+                    self._ensure_action_visible(action, "llm", result)
+                else:
+                    result = None
+        if result is None:
+            repository.record_routing_event("greentext_local_fallback")
+            result = greentext_fallback(episode)
+            producer = Producer.LOCAL
+        else:
+            producer = Producer.LLM
+        return self._create_response_plan(event, result, producer, "greentext", required=True,
+            actions=(RoutingCommit("greentext", "grounded"), GeneratedCommit(result, f"greentext:{episode.signature}")),
+            provider_key=(str(getattr(self.provider_for_chat(event.chat_id), "provider_key", "llm")) if producer == Producer.LLM else None))
 
     def prepare_reply(self, event, bot_id=None, bot_username=None):
         with self.response_planning():

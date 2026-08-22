@@ -273,6 +273,7 @@ class LearningService:
             provider_for_chat=self.provider_for_chat,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
+            generate_grounded_llm=self.generate_grounded_llm,
             llm_allowed=self.llm_allowed,
             troll_mode=self.troll_mode,
             media_enabled=self.media_enabled,
@@ -783,6 +784,10 @@ class LearningService:
         self.generation.llm_allowed_check = self.llm_allowed
         return self.generation.generate_llm(chat_id, context, purpose, conversation_decision, chat_state)
 
+    def generate_grounded_llm(self, chat_id, request):
+        self.generation.llm_allowed_check = self.llm_allowed
+        return self.generation.generate_grounded(chat_id, request)
+
     def _policy_quiet_hours(self):
         self._sync_foreground_runtime_ports()
         return self.foreground._policy_quiet_hours()
@@ -872,6 +877,7 @@ class LearningService:
             provider_for_chat=self.provider_for_chat,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
+            generate_grounded_llm=self.generate_grounded_llm,
             llm_allowed=self.llm_allowed,
             troll_mode=self.troll_mode,
             media_enabled=self.media_enabled,

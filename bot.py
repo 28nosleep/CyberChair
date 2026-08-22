@@ -52,6 +52,7 @@ from learning import (
     Producer,
     ResponsePlan,
 )
+from learning.greentext import is_greentext_command
 from learning.preprocessing import (
     FOREIGN_BOT_COMMAND_RE,
     VOICE_STORY_COMMAND_RE,
@@ -1569,6 +1570,17 @@ def handle_message(message, event):
     # Do not learn from or react to URLs, including deliberately space-separated
     # ones such as "https www instagram com reel ...".
     if contains_link(text):
+        return
+
+    # Explicit greentext owns the event before direct-address, social, free
+    # response and meme routing. It still ingests first so its snapshot is a
+    # consistent view of the real conference transcript.
+    if is_greentext_command(text):
+        learning_service.ingest_event(event, refresh_memory=False)
+        learning_service.context_snapshot(event)
+        with learning_service.response_planning():
+            plan = learning_service.foreground.prepare_greentext(event)
+        execute_response_plan(plan, message)
         return
 
     meme_match = CHAIR_MEME_COMMAND_RE.fullmatch(text)
