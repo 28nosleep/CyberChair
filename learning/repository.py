@@ -332,6 +332,169 @@ class ChatRepository:
             rows = db.execute("SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def relationship(self, user_id):
+        with self._lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT * FROM relationships WHERE chat_id=? AND user_id=?",
+                (self.chat_id, int(user_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_relationship(self, relationship):
+        values = (
+            self.chat_id, int(relationship.user_id), relationship.affinity,
+            relationship.irritation, relationship.respect, relationship.interest,
+            relationship.troll_tendency, relationship.familiarity,
+            relationship.interaction_count, relationship.positive_count,
+            relationship.negative_count, relationship.last_interaction_at,
+        )
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                """INSERT INTO relationships(
+                    chat_id,user_id,affinity,irritation,respect,interest,
+                    troll_tendency,familiarity,interaction_count,positive_count,
+                    negative_count,last_interaction_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                    affinity=excluded.affinity,
+                    irritation=excluded.irritation,
+                    respect=excluded.respect,
+                    interest=excluded.interest,
+                    troll_tendency=excluded.troll_tendency,
+                    familiarity=excluded.familiarity,
+                    interaction_count=excluded.interaction_count,
+                    positive_count=excluded.positive_count,
+                    negative_count=excluded.negative_count,
+                    last_interaction_at=excluded.last_interaction_at""",
+                values,
+            )
+
+    def add_evidence(
+        self, *, user_id, source_message_id, source_timestamp, source_text,
+        evidence_type, normalized_topic="", score=0.0, image_file_id=None,
+        image_file_unique_id=None, max_items=400, validate_message=True,
+    ):
+        """Persist only evidence backed by a stored message or accepted image."""
+        stamp = datetime.now(timezone.utc).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            if validate_message:
+                source = db.execute(
+                    "SELECT text,created_at,user_id FROM messages "
+                    "WHERE chat_id=? AND message_id=?",
+                    (self.chat_id, int(source_message_id)),
+                ).fetchone()
+                if source is None:
+                    return None
+                # The stored transcript is the authority. Callers cannot attach a
+                # fabricated quote to a real message id.
+                source_text = source["text"]
+                source_timestamp = source["created_at"]
+                user_id = source["user_id"]
+            elif not image_file_id:
+                return None
+            db.execute(
+                """INSERT INTO evidence(
+                    chat_id,user_id,source_message_id,source_timestamp,
+                    source_text,image_file_id,image_file_unique_id,evidence_type,
+                    normalized_topic,score,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(chat_id,source_message_id,evidence_type) DO UPDATE SET
+                    score=MAX(evidence.score,excluded.score),
+                    normalized_topic=excluded.normalized_topic,
+                    source_text=COALESCE(evidence.source_text,excluded.source_text),
+                    image_file_id=COALESCE(excluded.image_file_id,evidence.image_file_id),
+                    image_file_unique_id=COALESCE(
+                        excluded.image_file_unique_id,evidence.image_file_unique_id
+                    )""",
+                (
+                    self.chat_id, user_id, int(source_message_id),
+                    str(source_timestamp), source_text, image_file_id,
+                    image_file_unique_id, str(evidence_type),
+                    str(normalized_topic), float(score), stamp,
+                ),
+            )
+            db.execute(
+                "DELETE FROM evidence WHERE id IN ("
+                "SELECT id FROM evidence ORDER BY score DESC,created_at DESC "
+                "LIMIT -1 OFFSET ?)",
+                (max(1, int(max_items)),),
+            )
+            row = db.execute(
+                "SELECT * FROM evidence WHERE chat_id=? AND source_message_id=? "
+                "AND evidence_type=?",
+                (self.chat_id, int(source_message_id), str(evidence_type)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def evidence_candidates(self, user_id=None, limit=120):
+        query = "SELECT * FROM evidence WHERE chat_id=?"
+        params = [self.chat_id]
+        if user_id is not None:
+            # Images from other participants remain eligible as meme backgrounds;
+            # textual claims stay scoped by EvidenceEngine scoring.
+            query += " AND (user_id=? OR evidence_type='image')"
+            params.append(int(user_id))
+        query += " ORDER BY score DESC,created_at DESC LIMIT ?"
+        params.append(max(0, int(limit)))
+        with self._lock, closing(self._connect()) as db:
+            rows = db.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def evidence_by_id(self, evidence_id):
+        with self._lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT * FROM evidence WHERE chat_id=? AND id=?",
+                (self.chat_id, int(evidence_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_evidence_used(self, evidence_id, created_at=None):
+        stamp = (created_at or datetime.now(timezone.utc)).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            cursor = db.execute(
+                "UPDATE evidence SET use_count=use_count+1,last_used_at=? "
+                "WHERE chat_id=? AND id=?",
+                (stamp, self.chat_id, int(evidence_id)),
+            )
+        return cursor.rowcount > 0
+
+    def record_response_structure(
+        self, construction_signature, opening_id=None, fragment_ids=(),
+        closer_id=None, created_at=None, limit=80,
+    ):
+        stamp = (created_at or datetime.now(timezone.utc)).isoformat()
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                "INSERT INTO response_structures(chat_id,opening_id,fragment_ids,"
+                "closer_id,construction_signature,created_at) VALUES(?,?,?,?,?,?)",
+                (
+                    self.chat_id, opening_id,
+                    json.dumps(tuple(fragment_ids), ensure_ascii=False), closer_id,
+                    str(construction_signature), stamp,
+                ),
+            )
+            db.execute(
+                "DELETE FROM response_structures WHERE id NOT IN ("
+                "SELECT id FROM response_structures ORDER BY id DESC LIMIT ?)",
+                (max(10, int(limit)),),
+            )
+
+    def recent_response_structures(self, limit=40):
+        with self._lock, closing(self._connect()) as db:
+            rows = db.execute(
+                "SELECT * FROM response_structures WHERE chat_id=? "
+                "ORDER BY id DESC LIMIT ?", (self.chat_id, max(0, int(limit))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["fragment_ids"] = tuple(json.loads(item["fragment_ids"]))
+            except (TypeError, ValueError):
+                item["fragment_ids"] = ()
+            result.append(item)
+        return result
+
     def meme_source_messages(self, limit=5000):
         """Human quotes plus reply engagement, for deterministic meme ranking."""
         with self._lock, closing(self._connect()) as db, db:
@@ -1929,7 +2092,7 @@ class ChatRepository:
     def run_persistence_maintenance(
         self, current=None, *, llm_retention_days=90,
         routing_retention_days=31, scheduled_retention_days=14,
-        interval_seconds=86400, force=False,
+        evidence_retention_days=365, interval_seconds=86400, force=False,
     ):
         """Compact operational rows at most once per configured interval."""
         current = current or datetime.now(timezone.utc)
@@ -1944,6 +2107,9 @@ class ChatRepository:
         ).astimezone(timezone.utc).isoformat()
         scheduled_cutoff = (
             current - timedelta(days=max(1, int(scheduled_retention_days)))
+        ).astimezone(timezone.utc).isoformat()
+        evidence_cutoff = (
+            current - timedelta(days=max(30, int(evidence_retention_days)))
         ).astimezone(timezone.utc).isoformat()
         with self._lock, closing(self._connect()) as db, db:
             last_row = db.execute(
@@ -2012,6 +2178,10 @@ class ChatRepository:
                 "DELETE FROM chat_image_usage WHERE NOT EXISTS("
                 "SELECT 1 FROM chat_images "
                 "WHERE chat_images.file_unique_id=chat_image_usage.file_unique_id)"
+            ).rowcount
+            evidence_pruned = db.execute(
+                "DELETE FROM evidence WHERE created_at < ?",
+                (evidence_cutoff,),
             ).rowcount
             db.execute(
                 "INSERT INTO persistence_meta(key, value) "

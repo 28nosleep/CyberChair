@@ -23,6 +23,11 @@ class TriggerEngine:
         while history and now - history[0] > 300:
             history.popleft()
 
+    def observed_message_count(self, chat_id):
+        """Number of runtime-ingested messages still known to this process."""
+        with self._lock:
+            return len(self._history[chat_id])
+
     def note_chair(self, chat_id):
         now = self.clock()
         history = self._chair_history[chat_id]

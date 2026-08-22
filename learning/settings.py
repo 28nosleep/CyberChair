@@ -196,6 +196,15 @@ class LearningSettings:
     summary_time_interval: int = field(default_factory=lambda: _int("SUMMARY_TIME_INTERVAL", 1200))
     max_long_memories: int = field(default_factory=lambda: _int("MAX_LONG_MEMORIES", 40))
     max_stored_text_length: int = field(default_factory=lambda: _int("MAX_STORED_TEXT_LENGTH", 2000))
+    max_evidence_per_chat: int = field(
+        default_factory=lambda: max(50, _int("MAX_EVIDENCE_PER_CHAT", 400))
+    )
+    evidence_retention_days: int = field(
+        default_factory=lambda: max(30, _int("EVIDENCE_RETENTION_DAYS", 365))
+    )
+    evidence_reuse_cooldown_days: int = field(
+        default_factory=lambda: max(1, _int("EVIDENCE_REUSE_COOLDOWN_DAYS", 7))
+    )
     allow_user_mentions: bool = field(default_factory=lambda: _bool("ALLOW_USER_MENTIONS", False))
     quiet_start_hour: int = field(default_factory=lambda: _int("QUIET_START_HOUR", 23))
     quiet_end_hour: int = field(default_factory=lambda: _int("QUIET_END_HOUR", 8))

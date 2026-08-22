@@ -13,10 +13,10 @@ from .pending_conversation import (
 )
 from .preprocessing import normalize_spaces
 from .response_plan import (
-    DeliveryType, GeneratedCommit, ManualMemeCommit, MediaPayload,
+    DeliveryType, EvidenceUsageCommit, GeneratedCommit, ManualMemeCommit, MediaPayload,
     MediaUsageCommit, PendingCreate, PendingFinalize, PersonaUsageCommit,
-    PolicyTargetCommit, Producer, ResponsePlan, RoutingCommit,
-    SourceUsageCommit, TextPayload, TriggerCommit,
+    PolicyTargetCommit, Producer, ReactionPayload, ResponsePlan, RoutingCommit,
+    SourceUsageCommit, StructureUsageCommit, TextPayload, TriggerCommit,
 )
 
 
@@ -130,6 +130,25 @@ class ResponseLifecycle:
             provider_key=provider_key,
         )
 
+    def prepare_reaction_response(self, event, emoji, purpose="social_reaction", *,
+                                  actions=()):
+        event = self._normalized_event(event)
+        plan = ResponsePlan(
+            event_id=event.event_id,
+            chat_id=event.chat_id,
+            producer=Producer.REACTION,
+            delivery_type=DeliveryType.REACTION,
+            payload=ReactionPayload(str(emoji)),
+            reply_to_message_id=event.message_id,
+            purpose=purpose,
+            commit_actions=tuple(actions),
+        )
+        self.repository(event.chat_id).record_routing_event(
+            "response_plan_created", event_id=event.event_id,
+            call_type=purpose,
+        )
+        return plan
+
     def prepare_manual_meme_response(
         self, event, decision, prepared_path, cleanup_paths=(),
     ):
@@ -173,8 +192,8 @@ class ResponseLifecycle:
 
     def _response_plan_key(self, plan):
         payload_identity = (
-            plan.payload.text
-            if isinstance(plan.payload, TextPayload)
+            plan.payload.text if isinstance(plan.payload, TextPayload)
+            else plan.payload.emoji if isinstance(plan.payload, ReactionPayload)
             else plan.payload.decision
         )
         return (
@@ -239,6 +258,15 @@ class ResponseLifecycle:
                     repository.mark_used(action.texts)
                 elif isinstance(action, ManualMemeCommit):
                     self.mark_command_meme_sent(plan.chat_id, action.decision)
+                elif isinstance(action, EvidenceUsageCommit):
+                    repository.mark_evidence_used(action.evidence_id)
+                elif isinstance(action, StructureUsageCommit):
+                    repository.record_response_structure(
+                        action.construction_signature,
+                        action.opening_id,
+                        action.fragment_ids,
+                        action.closer_id,
+                    )
             repository.record_routing_event(
                 "delivery_success", event_id=plan.event_id,
                 provider_key=plan.provider_key,

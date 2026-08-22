@@ -14,6 +14,8 @@ class Producer(str, Enum):
     MEDIA = "media"
     MEME = "meme"
     SYSTEM = "system"
+    REACTION = "reaction"
+    EVIDENCE = "evidence"
 
 
 class DeliveryType(str, Enum):
@@ -21,6 +23,7 @@ class DeliveryType(str, Enum):
     PHOTO = "photo"
     ANIMATION = "animation"
     STICKER = "sticker"
+    REACTION = "reaction"
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,11 @@ class TextPayload:
 class MediaPayload:
     decision: MediaDecision
     prepared_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class ReactionPayload:
+    emoji: str
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,19 @@ class ManualMemeCommit:
     decision: MediaDecision
 
 
+@dataclass(frozen=True)
+class EvidenceUsageCommit:
+    evidence_id: int
+
+
+@dataclass(frozen=True)
+class StructureUsageCommit:
+    construction_signature: str
+    opening_id: str | None = None
+    fragment_ids: tuple[str, ...] = ()
+    closer_id: str | None = None
+
+
 CommitAction = (
     GeneratedCommit
     | TriggerCommit
@@ -107,6 +128,8 @@ CommitAction = (
     | PersonaUsageCommit
     | SourceUsageCommit
     | ManualMemeCommit
+    | EvidenceUsageCommit
+    | StructureUsageCommit
 )
 
 
@@ -118,7 +141,7 @@ class ResponsePlan:
     chat_id: int
     producer: Producer
     delivery_type: DeliveryType
-    payload: TextPayload | MediaPayload
+    payload: TextPayload | MediaPayload | ReactionPayload
     reply_to_message_id: int | None = None
     required: bool = False
     purpose: str = "reply"
@@ -128,11 +151,13 @@ class ResponsePlan:
     cleanup_paths: tuple[Path, ...] = ()
 
     def __post_init__(self):
-        if self.delivery_type == DeliveryType.TEXT and not isinstance(
-            self.payload, TextPayload
-        ):
+        if self.delivery_type == DeliveryType.TEXT and not isinstance(self.payload, TextPayload):
             raise ValueError("text delivery requires TextPayload")
-        if self.delivery_type != DeliveryType.TEXT and not isinstance(
+        if self.delivery_type == DeliveryType.REACTION and not isinstance(
+            self.payload, ReactionPayload
+        ):
+            raise ValueError("reaction delivery requires ReactionPayload")
+        if self.delivery_type not in {DeliveryType.TEXT, DeliveryType.REACTION} and not isinstance(
             self.payload, MediaPayload
         ):
             raise ValueError("media delivery requires MediaPayload")

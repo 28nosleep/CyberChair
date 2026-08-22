@@ -21,7 +21,8 @@ class MemoryFacade:
         self, *, settings, repository, normalize_event, enabled, triggers,
         invalidate_generation, memory_maintenance, troll_mode,
         provider_name, provider_available, activity_percent,
-        autonomous_enabled, media_enabled,
+        autonomous_enabled, media_enabled, relationship_model,
+        moment_detector, evidence_engine,
     ):
         self.settings=settings
         self.repository=repository
@@ -36,6 +37,9 @@ class MemoryFacade:
         self.activity_percent=activity_percent
         self.autonomous_enabled=autonomous_enabled
         self.media_enabled=media_enabled
+        self.relationship_model=relationship_model
+        self.moment_detector=moment_detector
+        self.evidence_engine=evidence_engine
 
     def ingest(self, message, refresh_memory=True):
         event = self._normalized_event(message)
@@ -62,6 +66,14 @@ class MemoryFacade:
             return_reason=True,
         )
         if inserted:
+            recent_rows = repository.recent_messages(
+                self.moment_detector.max_messages
+            )
+            moments = self.moment_detector.detect(
+                recent_rows, event.message_id
+            )
+            self.relationship_model.observe(repository, event, recent_rows)
+            self.evidence_engine.capture_message(repository, event, moments)
             self.triggers.note_message(chat_id)
             self.invalidate_generation(chat_id)
             count = repository.count()
@@ -87,6 +99,7 @@ class MemoryFacade:
             llm_retention_days=self.settings.llm_call_retention_days,
             routing_retention_days=self.settings.routing_event_retention_days,
             scheduled_retention_days=self.settings.scheduled_event_retention_days,
+            evidence_retention_days=self.settings.evidence_retention_days,
             interval_seconds=(
                 self.settings.persistence_maintenance_interval_seconds
             ),

@@ -19,6 +19,10 @@ from .service import LearningService
 from .settings import LearningSettings
 from .direct_address import DirectAddressRouter, LocalIntentClassifier, ResponseDecision
 from .local_responder import LocalResponder
+from .relationship import Relationship, RelationshipModel
+from .moment_detector import MOMENT_TYPES, Moment, MomentDetector
+from .evidence_engine import Evidence, EvidenceEngine
+from .response_selector import ResponseKind, ResponseSelection, ResponseSelector
 from .pending_conversation import PendingConversation
 from .chat_action import ChatActionManager, MEDIA_CHAT_ACTIONS
 from .event_context import (
@@ -41,6 +45,7 @@ from .response_plan import (
     DeliveryType,
     MediaPayload,
     Producer,
+    ReactionPayload,
     ResponsePlan,
     TextPayload,
 )
@@ -89,6 +94,7 @@ __all__ = [
     "DeliveryType",
     "MediaPayload",
     "Producer",
+    "ReactionPayload",
     "ResponsePlan",
     "TextPayload",
     "ContextSnapshot",
@@ -141,6 +147,16 @@ __all__ = [
     "LocalIntentClassifier",
     "ResponseDecision",
     "LocalResponder",
+    "Relationship",
+    "RelationshipModel",
+    "MOMENT_TYPES",
+    "Moment",
+    "MomentDetector",
+    "Evidence",
+    "EvidenceEngine",
+    "ResponseKind",
+    "ResponseSelection",
+    "ResponseSelector",
     "PendingConversation",
     "ChatActionManager",
     "MEDIA_CHAT_ACTIONS",

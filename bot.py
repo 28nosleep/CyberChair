@@ -18,7 +18,7 @@ from env_loader import load_environment
 load_environment(Path(__file__).resolve().parent)
 
 import telebot
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 
 from utils import (
     format_time,
@@ -155,6 +155,7 @@ def telegram_callback_event_handler(handler):
                 if not admission:
                     return None
                 with learning_service.telegram_user_event(event):
+                    learning_service.observe_callback(event)
                     return handler(call, event, *args, **kwargs)
     return correlated
 
@@ -218,6 +219,18 @@ def deliver_response_plan(plan, message=None):
                 plan.payload.decision.asset_id,
                 reply_to_message_id=reply_to,
             )
+        elif plan.delivery_type == DeliveryType.REACTION:
+            if reply_to is None:
+                return DeliveryReceipt(
+                    plan.event_id, False, plan.delivery_type,
+                    error_category="missing_reaction_target",
+                )
+            bot.set_message_reaction(
+                plan.chat_id,
+                reply_to,
+                [ReactionTypeEmoji(plan.payload.emoji)],
+            )
+            sent = None
         elif plan.delivery_type == DeliveryType.PHOTO:
             path = plan.payload.prepared_path
             if path is None:

@@ -52,7 +52,10 @@ class MemeRenderer:
     @staticmethod
     def _supports_text(font, text):
         replacement = bytes(font.getmask("\ufffd"))
-        for char in text:
+        # Font support depends on the character set, not its frequency. Long
+        # repeated captions previously rasterized the same Cyrillic glyph
+        # thousands of times during every font-size probe.
+        for char in dict.fromkeys(text):
             if char.isspace() or char.isascii():
                 continue
             if bytes(font.getmask(char)) == replacement:

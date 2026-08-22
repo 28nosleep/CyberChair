@@ -33,7 +33,7 @@ class MediaCoordinator:
         media, media_catalog, meme_renderer, meme_sources, quality_guard,
         memory, persona, rng, concurrency, activity_allows, media_enabled,
         troll_mode, provider_available, generate_llm,
-        command_meme_sources, lock, photo_meme_caption_re,
+        command_meme_sources, lock, photo_meme_caption_re, evidence_engine=None,
     ):
         self.settings=settings
         self.repository=repository
@@ -56,6 +56,7 @@ class MediaCoordinator:
         self._command_meme_sources=command_meme_sources
         self._lock=lock
         self._photo_meme_caption_re=photo_meme_caption_re
+        self.evidence_engine=evidence_engine
         self._meme_cooldown = self.meme_command_on_cooldown
         self._local_caption = self._local_command_caption
 
@@ -172,6 +173,10 @@ class MediaCoordinator:
         inserted = self.repository(event.chat_id).add_chat_image(
             **metadata, max_images=self.settings.max_chat_images_per_chat
         )
+        if self.evidence_engine is not None and not metadata["from_bot"]:
+            self.evidence_engine.capture_image(
+                self.repository(event.chat_id), metadata
+            )
         if inserted:
             log.info(
                 "Chat image metadata accepted chat=%s message=%s from_bot=%s",

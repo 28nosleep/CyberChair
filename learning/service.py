@@ -34,6 +34,10 @@ from .meme_sources import MemeSourceSelector
 from .persona import PersonaBuilder
 from .lexical_diversity import LexicalDiversityTracker
 from .response_quality import ResponseQualityGuard
+from .relationship import RelationshipModel
+from .moment_detector import MomentDetector
+from .evidence_engine import EvidenceEngine
+from .response_selector import ResponseSelector
 from .context_snapshot import ContextSnapshotBuilder
 from .concurrency import process_concurrency_controller
 from .preprocessing import (
@@ -145,6 +149,13 @@ class LearningService:
         self.chat_state_analyzer = ChatStateAnalyzer(settings, self.memory)
         self.conversation_policy = ConversationPolicy(settings)
         self.autonomous_policy = AutonomousPolicy(settings, self.conversation_policy)
+        self.relationship_model = RelationshipModel()
+        self.moment_detector = MomentDetector(settings.context_message_limit * 2)
+        self.evidence_engine = EvidenceEngine(
+            settings.max_evidence_per_chat,
+            settings.evidence_reuse_cooldown_days,
+        )
+        self.response_selector = ResponseSelector(self.rng)
         self.meme_lexicon = MemeLexicon()
         self.lexical_diversity = LexicalDiversityTracker()
         self.quality_guard = ResponseQualityGuard(self.lexical_diversity)
@@ -205,6 +216,9 @@ class LearningService:
             activity_percent=self.activity_percent,
             autonomous_enabled=self.autonomous_enabled,
             media_enabled=self.media_enabled,
+            relationship_model=self.relationship_model,
+            moment_detector=self.moment_detector,
+            evidence_engine=self.evidence_engine,
         )
         self.media_coordinator = MediaCoordinator(
             settings=self.settings,
@@ -228,6 +242,7 @@ class LearningService:
             command_meme_sources=self._command_meme_sources,
             lock=self._lock,
             photo_meme_caption_re=PHOTO_MEME_CAPTION_RE,
+            evidence_engine=self.evidence_engine,
         )
         self.response_lifecycle = ResponseLifecycle(
             repository=self.repository,
@@ -254,6 +269,7 @@ class LearningService:
             create_response_plan=self._create_response_plan,
             pending_create_action=self._pending_create_action,
             delivery_type_for_media=self._delivery_type_for_media,
+            prepare_reaction_response=self.prepare_reaction_response,
             provider_for_chat=self.provider_for_chat,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
@@ -278,6 +294,10 @@ class LearningService:
             memory=self.memory,
             persona=self.persona,
             meme_lexicon=self.meme_lexicon,
+            relationship_model=self.relationship_model,
+            moment_detector=self.moment_detector,
+            evidence_engine=self.evidence_engine,
+            response_selector=self.response_selector,
             triggers=self.triggers,
             rng=self.rng,
             lock=self._lock,
@@ -607,6 +627,11 @@ class LearningService:
         # observe normalized-event ingestion through this compatibility API.
         return self.ingest(event, refresh_memory=refresh_memory)
 
+    def observe_callback(self, event):
+        return self.relationship_model.observe_callback(
+            self.repository(event.chat_id), event
+        )
+
     def run_memory_maintenance(self, chat_id, current=None):
         return self.memory_facade.run_memory_maintenance(chat_id, current)
 
@@ -795,6 +820,13 @@ class LearningService:
     ):
         return self.response_lifecycle.prepare_text_response(event, text, purpose, producer=producer, required=required, actions=actions, behavior_mode=behavior_mode, provider_key=provider_key)
 
+    def prepare_reaction_response(
+        self, event, emoji, purpose="social_reaction", *, actions=()
+    ):
+        return self.response_lifecycle.prepare_reaction_response(
+            event, emoji, purpose, actions=actions
+        )
+
     def prepare_manual_meme_response(
         self, event, decision, prepared_path, cleanup_paths=(),
     ):
@@ -836,6 +868,7 @@ class LearningService:
             _create_response_plan=self._create_response_plan,
             _pending_create_action=self._pending_create_action,
             _delivery_type_for_media=self._delivery_type_for_media,
+            prepare_reaction_response=self.prepare_reaction_response,
             provider_for_chat=self.provider_for_chat,
             provider_available=self.provider_available,
             generate_llm=self.generate_llm,
@@ -860,6 +893,10 @@ class LearningService:
             memory=self.memory,
             persona=self.persona,
             meme_lexicon=self.meme_lexicon,
+            relationship_model=self.relationship_model,
+            moment_detector=self.moment_detector,
+            evidence_engine=self.evidence_engine,
+            response_selector=self.response_selector,
             triggers=self.triggers,
             rng=self.rng,
         )

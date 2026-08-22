@@ -8,6 +8,7 @@ media or memory algorithms, or commit a delivered ResponsePlan.
 import hashlib
 import logging
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from .direct_address import SOCIAL, SUBSTANTIVE
@@ -17,9 +18,11 @@ from .pending_conversation import (
     looks_like_continuation, question_intent,
 )
 from .preprocessing import normalize_spaces, significant_words
+from .response_selector import ResponseKind
 from .response_plan import (
-    GeneratedCommit, MediaUsageCommit, PendingFinalize, PersonaUsageCommit,
-    PolicyTargetCommit, Producer, RoutingCommit, SourceUsageCommit, TriggerCommit,
+    EvidenceUsageCommit, GeneratedCommit, MediaUsageCommit, PendingFinalize, PersonaUsageCommit,
+    PolicyTargetCommit, Producer, RoutingCommit, SourceUsageCommit,
+    StructureUsageCommit, TriggerCommit,
 )
 
 
@@ -34,6 +37,7 @@ class ForegroundOrchestrator:
         self, *, settings, repository, normalize_event, active_snapshot,
         as_utc, enabled, context_snapshot, media_context_snapshot,
         create_response_plan, pending_create_action, delivery_type_for_media,
+        prepare_reaction_response,
         provider_for_chat, provider_available, generate_llm,
         llm_allowed, troll_mode, media_enabled,
         budget_exceeded, chair_meta_on_cooldown,
@@ -41,7 +45,8 @@ class ForegroundOrchestrator:
         deterministic_media_roll, policy_quiet_hours,
         response_activity, ensure_action_visible, chat_state_analyzer,
         conversation_policy, direct_router, local_responder, date_time_utility,
-        media, memory, persona, meme_lexicon, triggers,
+        media, memory, persona, meme_lexicon, relationship_model,
+        moment_detector, evidence_engine, response_selector, triggers,
         rng, lock, clock,
     ):
         self.settings = settings
@@ -55,6 +60,7 @@ class ForegroundOrchestrator:
         self._create_response_plan = create_response_plan
         self._pending_create_action = pending_create_action
         self._delivery_type_for_media = delivery_type_for_media
+        self.prepare_reaction_response = prepare_reaction_response
         self.provider_for_chat = provider_for_chat
         self.provider_available = provider_available
         self.generate_llm = generate_llm
@@ -79,6 +85,10 @@ class ForegroundOrchestrator:
         self.memory = memory
         self.persona = persona
         self.meme_lexicon = meme_lexicon
+        self.relationship_model = relationship_model
+        self.moment_detector = moment_detector
+        self.evidence_engine = evidence_engine
+        self.response_selector = response_selector
         self.triggers = triggers
         self.rng = rng
         self._lock = lock
@@ -188,6 +198,13 @@ class ForegroundOrchestrator:
                 actions.append(PersonaUsageCommit(*persona_usage))
             if source_usage:
                 actions.append(SourceUsageCommit(tuple(source_usage)))
+            if hasattr(result, "construction_signature"):
+                actions.append(StructureUsageCommit(
+                    result.construction_signature,
+                    result.opening_id,
+                    tuple(result.fragment_ids),
+                    result.closer_id,
+                ))
             if isinstance(result, str) and behavior_mode != "troll_user":
                 pending_create = self._pending_create_action(
                     event, result, "substantive"
@@ -215,6 +232,11 @@ class ForegroundOrchestrator:
             if isinstance(result, MediaDecision) else result,
             f"direct_{route}",
         )
+        if hasattr(result, "construction_signature"):
+            repository.record_response_structure(
+                result.construction_signature, result.opening_id,
+                result.fragment_ids, result.closer_id,
+            )
         self._remember_policy_target(chat_id, event)
         if isinstance(result, str) and behavior_mode != "troll_user":
             self._store_pending_from_response(message, result, "substantive")
@@ -621,8 +643,14 @@ class ForegroundOrchestrator:
             )
         if not self.troll_mode(chat_id) and not addressed:
             return None
+        repository = self.repository(chat_id)
+        if (
+            repository.count() < self.settings.min_training_messages
+            and self.triggers.observed_message_count(chat_id) > 0
+        ):
+            return None
         state = self.chat_state_analyzer.analyze(
-            self.repository(chat_id),
+            repository,
             incoming_message=event,
             bot_id=bot_id,
             last_target_user_id=self._last_policy_target_user.get(chat_id),
@@ -664,7 +692,115 @@ class ForegroundOrchestrator:
             kind = "random"
         else:
             kind = "openai_random"
-        repository = self.repository(chat_id)
+        social_rows = (
+            snapshot.recent_dialogue if snapshot is not None
+            else repository.recent_messages(self.moment_detector.max_messages)
+        )
+        moments = self.moment_detector.detect(social_rows, event.message_id)
+        moment = moments[0] if moments else None
+        relationship = (
+            self.relationship_model.current(repository, event.user_id)
+            if event.user_id is not None else None
+        )
+        evidence_candidates = self.evidence_engine.retrieve(
+            repository, text, moment, event.user_id, event.message_id,
+            current=event.timestamp,
+        )
+        if snapshot is not None and self.media_enabled(chat_id):
+            snapshot = self.media_context_snapshot(snapshot)
+        bot_rows = (
+            snapshot.recent_generated[-6:] if snapshot is not None
+            else repository.recent_generated(6)
+        )
+        current_at = self._as_utc(event.timestamp) or datetime.now(timezone.utc)
+        activity_cutoff = current_at - timedelta(minutes=15)
+        recent_bot_activity = []
+        for row in bot_rows:
+            created = self._as_utc(row.get("created_at"))
+            if created is not None and created >= activity_cutoff:
+                recent_bot_activity.append(row)
+        recent_media_usage = (
+            snapshot.media.recent_usage if snapshot is not None and snapshot.media
+            else repository.recent_media_usage(6)
+        )
+        memory_meme = (
+            self.media.memory_meme(
+                repository, text, event.user_id, event.message_id
+            )
+            if self.media_enabled(chat_id) and moment is not None
+            else None
+        )
+        # ConversationPolicy has already sampled the established baseline reply
+        # rate. With no notable moment, preserve that rate and only let the
+        # selector choose TEXT; do not add a second silence lottery.
+        legacy_forced = moment is None
+        social_selection = self.response_selector.select(
+            moment=moment,
+            relationship=relationship,
+            evidence_candidates=evidence_candidates,
+            recent_bot_activity=recent_bot_activity,
+            recent_media_usage=recent_media_usage,
+            media_enabled=self.media_enabled(chat_id),
+            memory_meme_available=memory_meme is not None,
+            required=legacy_forced,
+        )
+        repository.record_routing_event(
+            f"social_choice_{social_selection.kind.value}",
+            event_id=event.event_id,
+        )
+        if moment is not None:
+            repository.record_routing_event(
+                f"social_moment_{moment.moment_type}", event_id=event.event_id
+            )
+        if social_selection.kind == ResponseKind.SILENCE:
+            return None
+        if relationship is not None:
+            adjusted = decision.troll_intensity + (
+                relationship.irritation - relationship.affinity
+            ) * .12 + relationship.troll_tendency * .04
+            decision = replace(
+                decision, troll_intensity=round(max(.15, min(.9, adjusted)), 3)
+            )
+        if social_selection.kind == ResponseKind.REACTION:
+            actions = (
+                TriggerCommit(kind),
+                GeneratedCommit(social_selection.reaction or "reaction", "social_reaction"),
+                PolicyTargetCommit(event.user_id, event.message_id),
+            )
+            if _as_plan:
+                return self.prepare_reaction_response(
+                    event, social_selection.reaction, actions=actions
+                )
+            self.triggers.commit(chat_id, kind)
+            repository.record_generated(
+                social_selection.reaction or "reaction", "social_reaction"
+            )
+            self._remember_policy_target(chat_id, event)
+            return None
+        if social_selection.kind == ResponseKind.EVIDENCE:
+            evidence = next(
+                (item for item in evidence_candidates
+                 if item.id == social_selection.evidence_id), None
+            )
+            result = self.evidence_engine.callback_text(evidence, text)
+            if not result:
+                return None
+            actions = (
+                TriggerCommit(kind),
+                GeneratedCommit(result, "social_evidence"),
+                EvidenceUsageCommit(evidence.id),
+                PolicyTargetCommit(event.user_id, event.message_id),
+            )
+            if _as_plan:
+                return self._create_response_plan(
+                    event, result, Producer.EVIDENCE, "social_evidence",
+                    actions=actions,
+                )
+            self.triggers.commit(chat_id, kind)
+            repository.record_generated(result, "social_evidence")
+            repository.mark_evidence_used(evidence.id)
+            self._remember_policy_target(chat_id, event)
+            return result
         day_summary = (
             snapshot.current_summary if snapshot is not None
             else repository.summary_for_day(self.memory.logical_day()) or {}
@@ -683,9 +819,12 @@ class ForegroundOrchestrator:
             limit=3,
         )
         media_decision = MediaDecision(reason="media_disabled")
-        if self.media_enabled(chat_id):
-            if snapshot is not None:
-                snapshot = self.media_context_snapshot(snapshot)
+        wants_media = social_selection.kind in {
+            ResponseKind.GIF, ResponseKind.STICKER, ResponseKind.MEME
+        }
+        if social_selection.kind == ResponseKind.MEME and memory_meme is not None:
+            media_decision = memory_meme
+        elif self.media_enabled(chat_id) and (wants_media or legacy_forced):
             media_decision = self.media.decide(
                 chat_id=chat_id,
                 repository=repository,
@@ -716,6 +855,8 @@ class ForegroundOrchestrator:
                 ),
                 media_context=(snapshot.media if snapshot is not None else None),
             )
+            if wants_media and media_decision.action != social_selection.kind.value:
+                return None
         if media_decision.action != "none":
             if _as_plan:
                 return self._create_response_plan(
@@ -782,6 +923,13 @@ class ForegroundOrchestrator:
                     GeneratedCommit(result, kind),
                     PolicyTargetCommit(event.user_id, event.message_id),
                 ]
+                if hasattr(result, "construction_signature"):
+                    actions.append(StructureUsageCommit(
+                        result.construction_signature,
+                        result.opening_id,
+                        tuple(result.fragment_ids),
+                        result.closer_id,
+                    ))
                 if source_usage:
                     actions.append(SourceUsageCommit(tuple(source_usage)))
                 provider_key = None
@@ -795,6 +943,11 @@ class ForegroundOrchestrator:
                 )
             self.triggers.commit(chat_id, kind)
             self.repository(chat_id).record_generated(result, kind)
+            if hasattr(result, "construction_signature"):
+                repository.record_response_structure(
+                    result.construction_signature, result.opening_id,
+                    result.fragment_ids, result.closer_id,
+                )
             self._remember_policy_target(chat_id, event)
             log.info(
                 "Generated reply ready chat=%s trigger=%s generation_path=%s delivery=text",

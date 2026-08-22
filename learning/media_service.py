@@ -145,6 +145,41 @@ class MediaService:
         pool = [row for row in ranked[:5] if row["score"] >= best - 2.5]
         return self.rng.choice(pool)
 
+    def memory_meme(self, repository, current_text, current_user_id,
+                    current_message_id):
+        """Old real chat image + the current real quote; no invented premise."""
+        quote = re.sub(r"\s+", " ", str(current_text or "")).strip()
+        if not quote or len(quote) > self.settings.meme_quote_hard_limit:
+            return None
+        if len(quote) > self.settings.meme_quote_max_chars:
+            shortened = quote[: self.settings.meme_quote_max_chars - 1].rsplit(" ", 1)[0]
+            quote = (shortened or quote[: self.settings.meme_quote_max_chars - 1]).rstrip(".,;:") + "…"
+        ranked = self.score_chat_images(
+            repository, quote, current_user_id=current_user_id
+        )
+        if not ranked:
+            return None
+        image = ranked[0]
+        if image["score"] < 1.0:
+            return None
+        return MediaDecision(
+            action="meme",
+            source_message_id=int(current_message_id),
+            caption_text=quote,
+            confidence=min(1.0, .62 + max(0.0, image["score"]) * .02),
+            reason="memory_meme_chat_image",
+            asset_key=f"chat_image:{image['file_unique_id']}",
+            cooldown_group="chat_image",
+            archetype="memory_meme",
+            background_file_id=image["file_id"],
+            background_file_unique_id=image["file_unique_id"],
+            background_media_type=image["media_type"],
+            background_mime_type=image.get("mime_type"),
+            background_user_id=image.get("user_id"),
+            background_message_id=image.get("message_id"),
+            render_profile="top_bottom" if len(quote) > 70 else "top_caption",
+        )
+
     def _cooldown_active(self, repository, action=None, asset_key=None, group=None,
                          seconds=None, media_context=None):
         seconds = self.settings.media_cooldown if seconds is None else seconds

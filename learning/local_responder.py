@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 
 from .direct_address import SOCIAL, SUBSTANTIVE
 from .preprocessing import normalize_spaces
@@ -30,16 +31,35 @@ RESPONSES = {
 
 # Small semantic pieces, not a bank of complete interchangeable replies.
 FRAGMENTS = {
-    "reaction": ("ну да", "сильный заход", "вижу картину", "прекрасно"),
+    "reaction": ("ну приехали", "вижу", "прекрасно", "логично"),
     "judgement": (
         "а последствия опять назначишь виноватыми",
-        "уверенность есть, доказательная база вышла покурить",
-        "план звучит ровно до встречи с реальностью",
+        "план уже спорит с реальностью",
+        "сюжет сам себя пишет",
         "это уже не случайность, а выбранный стиль жизни",
     ),
     "closer": ("живём", "продолжай наблюдение", "записал в лор", "не останавливайся"),
     "machine": ("chairOS сверил протокол", "цель обнаружена", "система это запомнила"),
 }
+
+
+@dataclass(frozen=True)
+class LocalCandidate:
+    text: str
+    signature: str
+    opening_id: str | None = None
+    fragment_ids: tuple[str, ...] = ()
+    closer_id: str | None = None
+
+
+class StructuredLocalResponse(str):
+    def __new__(cls, candidate):
+        value = str.__new__(cls, candidate.text)
+        value.construction_signature = candidate.signature
+        value.opening_id = candidate.opening_id
+        value.fragment_ids = candidate.fragment_ids
+        value.closer_id = candidate.closer_id
+        return value
 
 NEUTRAL_RESPONSES = {
     "trivial": ("слушаю", "да, я здесь", "говорите", "на связи"),
@@ -64,16 +84,37 @@ class LocalResponder:
             if recent_generated is not None
             else [row["text"] for row in repository.recent_generated(40)]
         )
-        fresh = [item for item in variants if item not in recent] or list(variants)
+        candidates = [
+            item if isinstance(item, LocalCandidate)
+            else LocalCandidate(str(item), "short_reaction" if len(str(item).split()) <= 4 else "observation")
+            for item in variants
+        ]
+        fresh = [item for item in candidates if item.text not in recent] or candidates
+        structures = repository.recent_response_structures(40)
         if self.lexical_tracker:
-            scored = [(self.lexical_tracker.score(item, recent)[0], index, item)
-                      for index, item in enumerate(fresh)]
+            scored = []
+            for index, item in enumerate(fresh):
+                lexical = self.lexical_tracker.score(item.text, recent)[0]
+                structural = sum(
+                    8.0 if row["construction_signature"] == item.signature else 0.0
+                    for row in structures[:12]
+                )
+                structural += sum(
+                    4.0 if item.opening_id and row.get("opening_id") == item.opening_id else 0.0
+                    for row in structures[:16]
+                )
+                used_fragments = {
+                    fragment for row in structures[:12]
+                    for fragment in row.get("fragment_ids", ())
+                }
+                structural += len(used_fragments & set(item.fragment_ids)) * 2.5
+                scored.append((lexical + structural, index, item))
             best = min(item[0] for item in scored)
             if any(score > best + .25 for score, _, _ in scored):
                 repository.record_routing_event("lexical_penalty_triggered")
-            fresh = [item for score, _, item in scored if score <= best + .25]
+            fresh = [item for score, _, item in scored if score <= best + .5]
         index = min(len(fresh) - 1, int(self.rng.random() * len(fresh)))
-        return fresh[index]
+        return StructuredLocalResponse(fresh[index])
 
     @staticmethod
     def _terms(text):
@@ -101,16 +142,20 @@ class LocalResponder:
             return time_action.group(1).strip()
         words = cls_words = re.findall(r"[а-яёa-z0-9-]+", clean, re.I)
         del cls_words
-        return " ".join(words[-8:])[:100]
+        # A characteristic tail is usually enough context and avoids wrapping
+        # the whole incoming message in a template.
+        return " ".join(words[-5:])[:80]
 
     def _contextual_callback(self, text, stable_memories, recent_dialogue, user_id):
         terms = set(self._terms(text))
         candidates = []
+        # Stable summaries may shape a direct response as unattributed chat
+        # context, but are never phrased as a sourced past quote.
         for value in stable_memories or ():
             clean = normalize_spaces(str(value))
             overlap = terms & set(self._terms(clean))
             if overlap:
-                candidates.append((len(overlap) + 2, clean))
+                candidates.append((len(overlap), clean))
         for age, row in enumerate(reversed(tuple(recent_dialogue or ())[:-1])):
             if row.get("speaker") == "cyberchair":
                 continue
@@ -130,49 +175,62 @@ class LocalResponder:
         name = f"@{username}" if username else "бро"
         if intent == SUBSTANTIVE:
             return [
-                f"про «{topic}» вопрос понял, но без внешнего мозга содержательный ответ выдумывать не буду",
-                f"вижу вопрос про «{topic}»; local path тут только соврёт, повтори, когда внешний мозг отпустит cooldown",
-                f"{name}, контекст про «{topic}» пойман, но внешний мозг недоступен — фактический фанфик не подсовываю",
+                LocalCandidate(
+                    f"про «{topic}» вопрос понял, но без внешнего мозга содержательный ответ выдумывать не буду",
+                    "topic_plus_limit", "topic_understood", ("provider_limit",),
+                ),
+                LocalCandidate(
+                    f"вопрос про «{topic}» вижу. локально тут получится только фанфик",
+                    "two_short_phrases", "question_seen", ("local_limit",),
+                ),
+                LocalCandidate(
+                    f"{name}, по «{topic}» нужен фактический ответ; внешний мозг сейчас недоступен",
+                    "address_plus_observation", "address", ("provider_limit",),
+                ),
             ]
         candidates = []
         if callback:
             return [
-                f"раньше было «{callback}», а теперь «{focus}» — лор сам себя уже опровергает",
-                f"сверил с прошлым: «{callback}». нынешнее «{focus}» выглядит как новый сезон того же сериала",
+                LocalCandidate(
+                    f"контекст темы — «{callback}». сейчас в кадре «{focus}»",
+                    "context_plus_observation", "topic_context", ("current_focus",), "current_frame",
+                ),
+                LocalCandidate(
+                    f"на фоне «{callback}» нынешнее «{focus}» выглядит особенно выразительно",
+                    "contextual_observation", "against_context", ("current_focus",),
+                ),
             ]
         if focus:
             candidates.extend((
-                f"{focus}, а последствия опять будут изображать внезапность",
-                f"в формулировке «{focus}» уже слышно, как план встречается с реальностью",
-                f"{name} принёс «{focus}» с уверенностью финального решения",
-                f"если кратко: {focus}. если честно: это ещё только начало арки",
-                f"по факту: {focus}, а оправдания уже разминаются у входа",
-                f"итог наблюдения: {focus} уверенно превращается в постоянную рубрику",
-                f"вот и приехали: {focus}, сюрприз назначен задним числом",
-                f"сюжет дня — {focus}; сценаристы опять отказались от реализма",
-                f"сначала было решение, потом появилось «{focus}» и всё встало на место",
-                f"{name}, «{focus}» звучит как начало отчёта, который никто не хотел писать",
+                LocalCandidate(f"{focus}. мощно", "short_reaction", None, ("focus",), "strong"),
+                LocalCandidate(f"«{focus}» — последствия уже делают вид, что незнакомы", "quote_plus_judgement", "quote", ("consequences",)),
+                LocalCandidate(f"у {name} сегодня отдельная сюжетная линия: {focus}", "contextual_observation", "participant_observation", ("focus",)),
+                LocalCandidate(f"{focus}. оправдания разминаются у входа", "two_short_phrases", None, ("focus",), "excuses"),
+                LocalCandidate(f"по факту — {focus}; по ощущениям — начало длинной арки", "parallel_observation", "in_fact", ("focus", "arc")),
+                LocalCandidate(f"{name}, «{focus}» — заявка в постоянную рубрику", "short_roast", "address", ("focus", "recurring_bit")),
+                LocalCandidate(f"и как именно «{focus}» должно пережить встречу с реальностью?", "rhetorical_question", "how_exactly", ("focus", "reality")),
+                LocalCandidate(f"сюжет дня: {focus}", "label_observation", "daily_plot", ("focus",)),
+                LocalCandidate(f"сначала решение. потом «{focus}». отличный таймлайн", "three_beats", "first_decision", ("focus",), "timeline"),
+                LocalCandidate(f"записал: {focus}. без выводов, они тут сами появятся", "observation_plus_closer", "recorded", ("focus",), "self_explaining"),
             ))
         reaction = FRAGMENTS["reaction"]
         judgement = FRAGMENTS["judgement"]
         for left, right in zip(reaction, judgement):
-            candidates.append(f"{left}: {focus or topic}, {right}")
+            candidates.append(LocalCandidate(
+                f"{left}: {focus or topic}. {right}",
+                "reaction_plus_observation", f"reaction_{left}",
+                (f"judgement_{right}",),
+            ))
         if troll_mode and focus and self.rng.random() < .04:
-            candidates.append(f"{FRAGMENTS['machine'][0]}: {focus}; {FRAGMENTS['closer'][2]}")
+            candidates.append(LocalCandidate(
+                f"{FRAGMENTS['machine'][0]}: {focus}; {FRAGMENTS['closer'][2]}",
+                "machine_observation", "machine_protocol", ("focus",), "lore_recorded",
+            ))
         return candidates
 
     def _history_pattern_candidates(self, text, recent_generated):
-        """Reuse only a short construction/opening, never another reply's premise."""
-        focus = self._focus(text)
-        for previous in reversed(tuple(recent_generated or ())[-30:]):
-            clean = normalize_spaces(str(previous))
-            opening = clean.partition(":")[0].strip(" .,!?:;—-")
-            words = opening.split()
-            if (
-                ":" in clean and 1 <= len(words) <= 3 and len(opening) <= 28
-                and not re.search(r"(?:chairos|классик|цель обнаружена)", opening, re.I)
-            ):
-                return [f"{opening}: {focus}, а дальше реальность сама допишет протокол"]
+        """Never copy a recent reply's construction as a pseudo-new template."""
+        del text, recent_generated
         return []
 
     def _troll_user(self, text, repository, excluded_meme_ids, excluded_meme_groups,
@@ -192,36 +250,28 @@ class LocalResponder:
             (r"кот|дом|переезд", "бытовой survival"),
         ) if re.search(pattern, normalized)), "этот план")
         detail = self._focus(text)
-        callbacks = []
-        terms = set(re.findall(r"[а-яёa-z0-9]{4,}", normalized))
-        for item in (
-            stable_memories
-            if stable_memories is not None else repository.stable_memories(20)
-        ):
-            value = normalize_spaces(str(item))
-            if terms & set(re.findall(r"[а-яёa-z0-9]{4,}", value.casefold())):
-                callbacks.append(value[:100])
-        if callbacks:
-            variants = [
-                f"раньше было «{callbacks[0]}», теперь «{detail}» — лор сам себя уже опровергает",
-                f"память говорит «{callbacks[0]}», текущая серия — «{detail}» и финала опять нет",
-            ]
-        else:
-            variants = [
-                f"«{detail}» — бро смотрит на {topic} так, будто финальный босс сам выдаст ему гайд",
-                f"достижение разблокировано: «{detail}» с уверенностью уже проигравшего туториал",
-                f"{detail}: {topic} опять пытаются закрыть одним сообщением, будто реальность подписана на премиум",
-                f"по формулировке «{detail}» видно: {topic} уже франшиза с нулевым бюджетом",
-                f"«{detail}» — заявка на то, чтобы взрослый интернет сделал за тебя домашку",
-                f"у тебя «{detail}» звучит как меню настроек перед переговорами с богом",
-            ]
+        del stable_memories
+        variants = [
+            LocalCandidate(f"«{detail}» — финальный босс даже не понял, что его вызвали", "quote_plus_roast", "quote", ("boss",)),
+            LocalCandidate(f"достижение разблокировано: «{detail}»", "achievement", "achievement", ("detail",)),
+            LocalCandidate(f"{detail}. реальность подписку не оформляла", "two_short_phrases", None, ("detail",), "reality_declines"),
+            LocalCandidate(f"по формулировке «{detail}» у {topic} уже второй сезон", "contextual_observation", "by_wording", ("detail", "topic", "season")),
+            LocalCandidate(f"«{detail}» — взрослый интернет сейчас должен сделать домашку?", "rhetorical_question", "adult_internet", ("detail", "homework")),
+            LocalCandidate(f"«{detail}»: меню настроек открыто, переговоры с реальностью провалены", "parallel_observation", "settings_menu", ("detail", "reality")),
+        ]
         result = self._choose_variant(variants, repository, recent_generated)
         selected = self.lexicon.select(
             text, {"mocking", "humor"}, .7, excluded_meme_ids,
             excluded_meme_groups, limit=1, recent_concepts=excluded_meme_groups,
         )
         if selected and selected[0].output not in result and self.rng.random() < .35:
-            result = f"{result}, {selected[0].output}"
+            result = StructuredLocalResponse(LocalCandidate(
+                f"{result}, {selected[0].output}",
+                result.construction_signature,
+                result.opening_id,
+                tuple(result.fragment_ids) + (f"meme_{selected[0].id}",),
+                result.closer_id,
+            ))
             return result, (selected[0],)
         return result, ()
 
@@ -282,7 +332,12 @@ class LocalResponder:
         if troll_mode and troll_intensity <= .4:
             # Low intensity stays the same character but does not randomly jump
             # to a high-intensity profanity variant.
-            variants = [item for item in variants if not PROFANITY_RE.search(item)] or variants
+            variants = [
+                item for item in variants
+                if not PROFANITY_RE.search(
+                    item.text if isinstance(item, LocalCandidate) else item
+                )
+            ] or variants
         result = self._choose_variant(variants, repository, recent_generated)
 
         # At most one lexicon concept, and only when it naturally fits a social
@@ -295,6 +350,12 @@ class LocalResponder:
                 recent_concepts=excluded_meme_groups,
             )
             if selected and selected[0].output not in result:
-                result = f"{result}, {selected[0].output}"
+                result = StructuredLocalResponse(LocalCandidate(
+                    f"{result}, {selected[0].output}",
+                    result.construction_signature,
+                    result.opening_id,
+                    tuple(result.fragment_ids) + (f"meme_{selected[0].id}",),
+                    result.closer_id,
+                ))
                 used = (selected[0],)
         return result, used

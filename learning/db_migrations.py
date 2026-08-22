@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 class SchemaMigrationError(RuntimeError):
@@ -413,12 +413,76 @@ def _migration_5(db):
     )
 
 
+def _migration_6(db):
+    """Add bounded, source-grounded social intelligence state."""
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS relationships (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            affinity REAL NOT NULL DEFAULT 0.5,
+            irritation REAL NOT NULL DEFAULT 0.0,
+            respect REAL NOT NULL DEFAULT 0.5,
+            interest REAL NOT NULL DEFAULT 0.25,
+            troll_tendency REAL NOT NULL DEFAULT 0.25,
+            familiarity REAL NOT NULL DEFAULT 0.0,
+            interaction_count INTEGER NOT NULL DEFAULT 0,
+            positive_count INTEGER NOT NULL DEFAULT 0,
+            negative_count INTEGER NOT NULL DEFAULT 0,
+            last_interaction_at TEXT NOT NULL,
+            PRIMARY KEY(chat_id, user_id)
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER,
+            source_message_id INTEGER NOT NULL,
+            source_timestamp TEXT NOT NULL,
+            source_text TEXT,
+            image_file_id TEXT,
+            image_file_unique_id TEXT,
+            evidence_type TEXT NOT NULL,
+            normalized_topic TEXT NOT NULL DEFAULT '',
+            score REAL NOT NULL DEFAULT 0.0,
+            use_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(chat_id, source_message_id, evidence_type)
+        )"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_lookup "
+        "ON evidence(chat_id, user_id, evidence_type, score DESC)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_recent "
+        "ON evidence(chat_id, created_at DESC)"
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS response_structures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            opening_id TEXT,
+            fragment_ids TEXT NOT NULL DEFAULT '[]',
+            closer_id TEXT,
+            construction_signature TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_response_structures_recent "
+        "ON response_structures(chat_id, created_at DESC)"
+    )
+
+
 MIGRATIONS = (
     Migration(1, "legacy_core_schema", _migration_1),
     Migration(2, "event_correlation_and_pending", _migration_2),
     Migration(3, "durable_summary_claims", _migration_3),
     Migration(4, "retention_aggregates_and_indexes", _migration_4),
     Migration(5, "reliable_scheduled_delivery", _migration_5),
+    Migration(6, "social_intelligence", _migration_6),
 )
 
 

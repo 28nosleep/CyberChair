@@ -31,7 +31,7 @@ def test_v4_claim_markers_migrate_as_terminal_history(tmp_path):
 
     upgraded = ChatRepository(tmp_path, -1, 50, 500)
     row = upgraded.scheduled_events()[0]
-    assert upgraded.current_schema_version() == CURRENT_SCHEMA_VERSION == 5
+    assert upgraded.current_schema_version() == CURRENT_SCHEMA_VERSION == 6
     assert row["state"] == "DEAD"
     assert row["payload"] == ""
     assert row["delivered_at"] is None
