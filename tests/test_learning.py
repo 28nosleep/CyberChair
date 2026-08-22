@@ -355,10 +355,18 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(len(set(minutes)), 2)
         self.assertTrue(all(11 * 60 <= item < 25 * 60 for item in minutes))
         self.assertEqual(minutes, daily_quote_minutes(datetime(2026, 8, 6, 0, 30)))
-        self.assertEqual(len(MOVIE_QUOTES), 81)
+        self.assertEqual(len(MOVIE_QUOTES), 101)
         self.assertEqual(
             len([quote for quote in MOVIE_QUOTES if quote[2] == "Call of Duty: World at War"]),
             20,
+        )
+        self.assertEqual(
+            len([quote for quote in MOVIE_QUOTES if quote[2] == "Call of Duty 2"]),
+            10,
+        )
+        self.assertEqual(
+            len([quote for quote in MOVIE_QUOTES if quote[2] == "Call of Duty 4: Modern Warfare"]),
+            10,
         )
         self.assertEqual(
             len([quote for quote in MOVIE_QUOTES if quote[2] == "Мистер Робот"]),
